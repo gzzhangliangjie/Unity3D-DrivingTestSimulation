@@ -3,6 +3,11 @@ using System.Collections;
 
 /// <summary>
 /// 【汽车核心类】汽车动能类
+/// 融合 EasyDriving 项目的改进（原项目: https://github.com/HWliiu/EasyDriving）：
+/// 1. 阿克曼转向角修正（内外前轮转角按几何差速计算，替代原来左右轮同角度）
+/// 2. 模拟量油门/刹车输入（0~1 连续值，为外接方向盘踏板与半坡半联动控制铺路）
+/// 3. 统一的每帧制动力合成（UI 刹车 / 模拟量刹车 / 手刹互不冲突）
+/// 兼容性：所有原有 public 字段与方法签名均保留，预制体与场景引用不受影响。
 /// </summary>
 public class DrivingKernel : MonoBehaviour
 {
@@ -32,10 +37,20 @@ public class DrivingKernel : MonoBehaviour
     [Header("就是汽车实际运行速度(KM/H)")]
     public float speed = 0;
     public float speedOrigin = 0;
-    
+
     [Header("方向盘UI预制件")]
     [Tooltip("自动查找并赋值，无需管理！")]
     public SteeringWheel2D steeringWheelUi;//UI方向盘鱼前车轮同步
+
+    [Header("===== EasyDriving 融合参数 =====")]
+    [Tooltip("启用阿克曼转向：内侧前轮转角大于外侧，转弯几何更接近真车")]
+    public bool useAckermannSteering = true;
+    [Tooltip("轴距（米）：前后轴中心距离，用于阿克曼计算")]
+    public float wheelBase = 2.6f;
+    [Tooltip("后轮距（米）：左右后轮中心距离，用于阿克曼计算")]
+    public float rearTrack = 1.5f;
+    [Tooltip("模拟量输入是否生效（由 HardwareInputController 自动置位）")]
+    public bool analogInputActive = false;
 
     [Header("UI档位类")]
     [Tooltip("自动查找并赋值，无需管理！")]
@@ -44,6 +59,14 @@ public class DrivingKernel : MonoBehaviour
     [SerializeField]
     private Car_HandleBrake Handle;
     private bool Handle_Flag = true;
+
+    // ---------- 内部输入状态 ----------
+    private float _steerInput = 0f;      // 归一化转向输入 -1(左)..1(右)
+    private float _analogThrottle = 0f;  // 模拟量油门 0..1
+    private float _analogBrake = 0f;     // 模拟量刹车 0..1
+    private bool _uiBrakeActive = false; // UI 布尔刹车状态
+    private float _flSteerDeg = 0f;      // 左前轮实际转角（阿克曼修正后）
+    private float _frSteerDeg = 0f;      // 右前轮实际转角
 
     private void Start()
     {
@@ -58,51 +81,113 @@ public class DrivingKernel : MonoBehaviour
 
     private void Update()
     {
-        /**********************************【PC端】*************************************
-        //空格-刹车
-        if (Input.GetKey(KeyCode.Space))
+        // ---------- 转向输入源选择 ----------
+        // 外接方向盘激活时使用硬件轴，否则使用 UI 方向盘
+        if (analogInputActive)
         {
-            rlWheelCollider.motorTorque = 0;
-            rrWheelCollider.motorTorque = 0;
-            rlWheelCollider.brakeTorque = brakeTorque;
-            rrWheelCollider.brakeTorque = brakeTorque;
+            _steerInput = Mathf.Clamp(_hardwareSteer, -1f, 1f);
         }
-        //W|S键，开始
-        if (Input.GetKeyDown(KeyCode.W) || Input.GetKeyDown(KeyCode.S))
+        else
         {
-            rlWheelCollider.brakeTorque = 0;
-            rrWheelCollider.brakeTorque = 0;
+            _steerInput = steeringWheelUi.wheelAngle / (steeringWheelUi.maximumSteeringAngle);
         }
-        //动力（车轮碰撞器）
-        rlWheelCollider.motorTorque = Input.GetAxis("Vertical") * motorTorque;
-        rrWheelCollider.motorTorque = Input.GetAxis("Vertical") * motorTorque;
-        //转向（车轮碰撞器）
-        flWheelCollider.steerAngle = Input.GetAxis("Horizontal") * steerAngle;
-        frWheelCollider.steerAngle = Input.GetAxis("Horizontal") * steerAngle;
-        /**********************************PC端-END****************************************/
 
-        /******************【移动端】UI方向盘旋转时控制轮子碰撞器的转动*******************/
-        flWheelCollider.steerAngle = steeringWheelUi.wheelAngle / ratio;
-        frWheelCollider.steerAngle = steeringWheelUi.wheelAngle / ratio;
-        /*********************************************************************************/
+        // ---------- 阿克曼转向角计算 ----------
+        ApplyAckermannSteering(_steerInput);
+
+        // ---------- 模拟量油门（外接踏板） ----------
+        if (analogInputActive)
+        {
+            ApplyAnalogThrottle();
+            ApplyBrakeForces();
+        }
 
         //转向系统
         SteerWheel();
         //转动车轮
         RotateWheel();
-        //手刹状态
-        if (Handle.Activate)
+        //手刹 + 布尔刹车（仅模拟量未激活时在此统一处理，模拟量路径已在上面合成）
+        if (!analogInputActive)
         {
-            Handle_Flag = true;
-            rlWheelCollider.brakeTorque = brakeTorque;
-            rrWheelCollider.brakeTorque = brakeTorque;
+            ApplyBrakeForces();
         }
-        else if(Handle_Flag)
+    }
+
+    /// <summary>
+    /// 阿克曼转向：由归一化转向输入计算左右前轮各自的转角并应用到 WheelCollider。
+    /// 公式：R = L / tan(δ)（转弯半径），内侧轮 atan(L / (R - T/2))，外侧轮 atan(L / (R + T/2))。
+    /// L=wheelBase 轴距，T=rearTrack 轮距。
+    /// </summary>
+    private void ApplyAckermannSteering(float steerInput)
+    {
+        float steerDeg = steerInput * steerAngle;
+
+        if (!useAckermannSteering || Mathf.Abs(steerDeg) < 0.01f)
         {
-            Handle_Flag = false;
-            rlWheelCollider.brakeTorque = 0;
-            rrWheelCollider.brakeTorque = 0;
+            _flSteerDeg = steerDeg;
+            _frSteerDeg = steerDeg;
         }
+        else
+        {
+            float radius = wheelBase / Mathf.Tan(Mathf.Abs(steerDeg) * Mathf.Deg2Rad);//转弯半径
+            float innerAngle = Mathf.Atan(wheelBase / Mathf.Max(radius - rearTrack * 0.5f, 0.01f)) * Mathf.Rad2Deg;
+            float outerAngle = Mathf.Atan(wheelBase / (radius + rearTrack * 0.5f)) * Mathf.Rad2Deg;
+
+            //steerDeg > 0（右转）：右前轮为内侧；steerDeg < 0（左转）：左前轮为内侧
+            if (steerDeg > 0f)
+            {
+                _frSteerDeg = innerAngle;
+                _flSteerDeg = outerAngle;
+            }
+            else
+            {
+                _flSteerDeg = innerAngle;
+                _frSteerDeg = outerAngle;
+            }
+        }
+
+        flWheelCollider.steerAngle = _flSteerDeg;
+        frWheelCollider.steerAngle = _frSteerDeg;
+    }
+
+    /// <summary>
+    /// 按当前档位应用模拟量油门（0~1），D 档前进 / R 档倒车 / P、N 档无动力。
+    /// </summary>
+    private void ApplyAnalogThrottle()
+    {
+        float torque = 0f;
+        if (_analogThrottle > 0.001f)
+        {
+            switch (Gears.gears)
+            {
+                case GearsDangWei_Control.currentGears.D:
+                    torque = _analogThrottle * motorTorque;
+                    break;
+                case GearsDangWei_Control.currentGears.R:
+                    torque = -_analogThrottle * motorTorque;
+                    break;
+            }
+        }
+        rlWheelCollider.motorTorque = torque;
+        rrWheelCollider.motorTorque = torque;
+    }
+
+    /// <summary>
+    /// 统一制动力合成：取 UI 布尔刹车、模拟量刹车中的较大值作用于前轮，
+    /// 后轮再叠加手刹。每帧统一写入，避免多条路径互相覆盖。
+    /// </summary>
+    private void ApplyBrakeForces()
+    {
+        float brakeNorm = Mathf.Max(_uiBrakeActive ? 1f : 0f, _analogBrake);
+        float brakeFront = brakeNorm * brakeTorque;
+        float brakeRear = Mathf.Max(brakeFront, Handle.Activate ? brakeTorque : 0f);
+
+        flWheelCollider.brakeTorque = brakeFront;
+        frWheelCollider.brakeTorque = brakeFront;
+        rlWheelCollider.brakeTorque = brakeRear;
+        rrWheelCollider.brakeTorque = brakeRear;
+
+        Handle_Flag = Handle.Activate;
     }
 
     /*
@@ -128,24 +213,73 @@ public class DrivingKernel : MonoBehaviour
     }
 
     /*
-     * 转向
+     * 转向（模型视觉同步：前轮模型按各自阿克曼转角偏转）
      */
     private void SteerWheel()
     {
-        //获取当前轮子转向角度
-        Vector3 localEulerAngles = flWheelModel.localEulerAngles;
-        localEulerAngles.y = flWheelCollider.steerAngle;
+        //左前轮模型
+        Vector3 flLocalEuler = flWheelModel.localEulerAngles;
+        flLocalEuler.y = _flSteerDeg;
+        flWheelModel.localEulerAngles = flLocalEuler;
+        //右前轮模型（阿克曼修正后与左轮转角不同）
+        Vector3 frLocalEuler = frWheelModel.localEulerAngles;
+        frLocalEuler.y = _frSteerDeg;
+        frWheelModel.localEulerAngles = frLocalEuler;
 
-        flWheelModel.localEulerAngles = localEulerAngles;//控制转向外部（flDiscBrake-父物体）
-        frWheelModel.localEulerAngles = localEulerAngles;
-
-        CurrentWheelAngle = flWheelCollider.steerAngle;
+        CurrentWheelAngle = _flSteerDeg;
 
         //同步方向盘（OK，是延自身旋转）
         Vector3 locaRv3 = SteeringWheel.localRotation.eulerAngles;
         locaRv3.z = -CurrentWheelAngle * ratio;
         SteeringWheel.localRotation = Quaternion.Euler(locaRv3);
     }
+
+    // ================= 外接方向盘/踏板接口（由 HardwareInputController 调用） =================
+
+    /// <summary>外接方向盘的归一化转向轴值（-1 左 .. 1 右）</summary>
+    private float _hardwareSteer = 0f;
+
+    /// <summary>
+    /// 设置外接方向盘转向输入。value: -1(最左)..1(最右)
+    /// </summary>
+    public void Hardware_SetSteering(float value)
+    {
+        _hardwareSteer = Mathf.Clamp(value, -1f, 1f);
+        analogInputActive = true;
+        //反向同步到 UI 方向盘，保持画面视觉一致；UI 停止触摸/回正逻辑
+        if (steeringWheelUi != null)
+        {
+            steeringWheelUi.hardwareControlled = true;
+            steeringWheelUi.wheelAngle = _hardwareSteer * steeringWheelUi.maximumSteeringAngle;
+        }
+    }
+
+    /// <summary>
+    /// 释放硬件/键盘接管，把输入控制权还给 UI 方向盘（未接入设备且无按键时由 HardwareInputController 调用）
+    /// </summary>
+    public void Hardware_ReleaseControl()
+    {
+        analogInputActive = false;
+        _hardwareSteer = 0f;
+        _analogThrottle = 0f;
+        _analogBrake = 0f;
+        if (steeringWheelUi != null)
+        {
+            steeringWheelUi.hardwareControlled = false;
+        }
+    }
+
+    /// <summary>
+    /// 设置外接踏板模拟量输入。throttle: 0..1 油门，brake: 0..1 刹车（半坡半联动可用中间值）
+    /// </summary>
+    public void Hardware_SetPedals(float throttle, float brake)
+    {
+        _analogThrottle = Mathf.Clamp01(throttle);
+        _analogBrake = Mathf.Clamp01(brake);
+        analogInputActive = true;
+    }
+
+    // ================= 原有公开接口（签名不变，外部脚本依赖） =================
 
     /// <summary>
     /// PUBLIC-油门踏板
@@ -229,7 +363,8 @@ public class DrivingKernel : MonoBehaviour
     /// </summary>
     public void Resistance()
     {
-        //四个轮子同时刹车
+        _uiBrakeActive = true;//交由 ApplyBrakeForces 每帧统一写入
+        //四个轮子同时刹车（立即生效，保持与原实现一致的即时响应）
         flWheelCollider.brakeTorque = brakeTorque;
         frWheelCollider.brakeTorque = brakeTorque;
         rlWheelCollider.brakeTorque = brakeTorque;
@@ -241,6 +376,7 @@ public class DrivingKernel : MonoBehaviour
     /// </summary>
     public void CancelResistance()
     {
+        _uiBrakeActive = false;
         flWheelCollider.brakeTorque = 0;
         frWheelCollider.brakeTorque = 0;
         rlWheelCollider.brakeTorque = 0;

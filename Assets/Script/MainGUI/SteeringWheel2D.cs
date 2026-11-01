@@ -20,6 +20,9 @@ public class SteeringWheel2D : MonoBehaviour
     public float wheelReleasedSpeed = 700f;
     [Header("方向盘当前旋转角度")]
     public float wheelAngle = 0f;
+    [Header("外接方向盘接管（由 HardwareInputController 自动置位）")]
+    [Tooltip("为 true 时忽略触摸/回正逻辑，wheelAngle 由外接方向盘驱动")]
+    public bool hardwareControlled = false;
     float wheelPrevAngle = 0f;
     bool wheelBeingHeld = false;
     RectTransform rectT;
@@ -129,13 +132,19 @@ public class SteeringWheel2D : MonoBehaviour
 
     /// <summary>
     /// Update is called once per frame.
-    /// Update the wheel status. If the 
+    /// Update the wheel status. If the
     /// wheel is released, reset the rotation
-    /// to initial (zero) rotation by 
+    /// to initial (zero) rotation by
     /// wheelReleasedSpeed degrees per second
     /// </summary>
     void Update()
     {
+        if (hardwareControlled)
+        {
+            //外接方向盘接管时：跳过触摸拖动与自动回正，仅做视觉同步
+            rectT.localEulerAngles = Vector3.back * wheelAngle;
+            return;
+        }
         if (!wheelBeingHeld && !Mathf.Approximately(0f, wheelAngle))
         {
             float deltaAngle = wheelReleasedSpeed * Time.deltaTime;
