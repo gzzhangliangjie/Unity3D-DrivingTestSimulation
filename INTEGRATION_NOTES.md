@@ -29,12 +29,12 @@
 | WheelClutch | Joy1 Axis 3 | 离合（预留） |
 
 3. **不同品牌踏板轴序不同**：如果油门刹车映射不对，在脚本 Inspector 里改 `axisThrottle`/`axisBrake` 的轴名（可在 Unity 输入调试器 Input Debugger 里看实际轴值）；分离式踏板保持 `useTriggerStyle = false`，手柄扳机类设备勾选 true
-4. 运行时检测到 Joystick 设备自动接管；手刹默认 `JoystickButton4`，可在 Inspector 改
+4. 运行时检测到 Joystick 设备自动接管；手刹默认 `JoystickButton4`，键盘手刹默认 `H`，均可在 Inspector 改
 5. 力反馈需要厂商 SDK，未包含
 
 ### 没有方向盘怎么办？
 三种输入方式自动降级，无需配置：
-- **键盘**：A/D 或方向键渐进打方向（`keyboardSteerSpeed` 控制打轮速度），W/↑ 油门，S/↓/空格 刹车
+- **键盘**：A/D 或方向键渐进打方向（`keyboardSteerSpeed` 控制打轮速度），W/↑ 油门，S/↓/空格 刹车，**H 手刹**
 - **鼠标/触摸**：拖拽屏幕 UI 方向盘（原功能不变）
 - 外设拔掉后自动切回，键盘松键后约 0.4 秒把控制权还给 UI 方向盘
 

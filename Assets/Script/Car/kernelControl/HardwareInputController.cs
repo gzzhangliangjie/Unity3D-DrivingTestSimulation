@@ -30,6 +30,8 @@ public class HardwareInputController : MonoBehaviour
     [Header("===== 按键映射 =====")]
     [Tooltip("手刹按键（罗技 G29 序列闸一般是 JoystickButton 手刹或离合全踩）")]
     public KeyCode handbrakeKey = KeyCode.JoystickButton4;
+    [Tooltip("键盘手刹键（H = Handbrake），与是否接入方向盘无关，按下即切换手刹")]
+    public KeyCode keyboardHandbrakeKey = KeyCode.H;
     [Tooltip("油门刹车合并式设备（如手柄扳机）时勾选：油门=throttle轴-刹车，刹车=另一轴")]
     public bool useTriggerStyle = false;
 
@@ -44,7 +46,7 @@ public class HardwareInputController : MonoBehaviour
     public bool enableHardwareInput = true;
 
     [Header("===== 键盘模拟（没有方向盘时） =====")]
-    [Tooltip("未检测到方向盘设备时，允许用键盘模拟：A/D(或方向键)转向，W(上)油门，S(下)/空格刹车")]
+    [Tooltip("未检测到方向盘设备时，允许用键盘模拟：A/D(或方向键)转向，W(上)油门，S(下)/空格刹车，H 手刹")]
     public bool keyboardFallback = true;
     [Tooltip("键盘打方向的速度（归一化/秒），越大方向盘打得越快")]
     public float keyboardSteerSpeed = 2.5f;
@@ -53,10 +55,12 @@ public class HardwareInputController : MonoBehaviour
     public bool DeviceConnected { get; private set; }
     private float _kbSteer = 0f;          // 键盘模拟的转向量 -1..1
     private float _kbHoldTimer = 0f;      // 松键后保持接管一小段时间，避免和 UI 打架
+    private Car_HandleBrake _handleBrake; // 手刹组件（UI 图标 + 音效都在它身上）
 
     private void Start()
     {
         _kernel = FindObjectOfType<DrivingKernel>();
+        _handleBrake = FindObjectOfType<Car_HandleBrake>();
         RefreshDeviceState();
     }
 
@@ -67,6 +71,9 @@ public class HardwareInputController : MonoBehaviour
 
         RefreshDeviceState();
 
+        //手刹与设备是否接入无关：硬件键和键盘 H 都能用
+        HandleHandbrake();
+
         if (DeviceConnected)
         {
             UpdateHardwareInput();
@@ -74,6 +81,37 @@ public class HardwareInputController : MonoBehaviour
         else if (keyboardFallback)
         {
             UpdateKeyboardInput();
+        }
+    }
+
+    /// <summary>
+    /// 切换手刹。必须走 ChangeState()，因为它在翻转 Activate 的同时
+    /// 还会同步 UI 图标和拉手刹音效；直接改 Activate 会导致图标与实际状态不一致。
+    /// </summary>
+    private void HandleHandbrake()
+    {
+        bool pressed = (handbrakeKey != KeyCode.None && Input.GetKeyDown(handbrakeKey))
+                    || (keyboardHandbrakeKey != KeyCode.None && Input.GetKeyDown(keyboardHandbrakeKey));
+        if (!pressed)
+            return;
+
+        //手刹 UI 可能在其他面板里，启动时未激活就找不到——按键时补找一次
+        if (_handleBrake == null)
+            _handleBrake = FindObjectOfType<Car_HandleBrake>();
+        if (_handleBrake == null)
+            return;
+
+        //ChangeState() 内部会访问 Image 与 AudioSource（它们在 Start 里才初始化），
+        //所以要求组件已经激活且两个依赖都在，否则退化为只翻标志，避免空引用
+        if (_handleBrake.isActiveAndEnabled
+            && _handleBrake.GetComponent<UnityEngine.UI.Image>() != null
+            && _handleBrake.GetComponent<AudioSource>() != null)
+        {
+            _handleBrake.ChangeState();
+        }
+        else
+        {
+            _handleBrake.Activate = !_handleBrake.Activate;
         }
     }
 
@@ -96,16 +134,6 @@ public class HardwareInputController : MonoBehaviour
         }
 
         _kernel.Hardware_SetPedals(throttle, brake);
-
-        // ---------- 手刹 ----------
-        if (Input.GetKeyDown(handbrakeKey))
-        {
-            Car_HandleBrake handle = FindObjectOfType<Car_HandleBrake>();
-            if (handle != null)
-            {
-                handle.Activate = !handle.Activate;
-            }
-        }
     }
 
     private void UpdateKeyboardInput()
