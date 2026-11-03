@@ -133,16 +133,19 @@ public class DrivingKernel : MonoBehaviour
             float innerAngle = Mathf.Atan(wheelBase / Mathf.Max(radius - rearTrack * 0.5f, 0.01f)) * Mathf.Rad2Deg;
             float outerAngle = Mathf.Atan(wheelBase / (radius + rearTrack * 0.5f)) * Mathf.Rad2Deg;
 
+            //上面按 |steerDeg| 算出的都是正角度，必须回乘转向符号，否则左右转都变成同一个方向
+            float sign = Mathf.Sign(steerDeg);
+
             //steerDeg > 0（右转）：右前轮为内侧；steerDeg < 0（左转）：左前轮为内侧
             if (steerDeg > 0f)
             {
-                _frSteerDeg = innerAngle;
-                _flSteerDeg = outerAngle;
+                _frSteerDeg = sign * innerAngle;
+                _flSteerDeg = sign * outerAngle;
             }
             else
             {
-                _flSteerDeg = innerAngle;
-                _frSteerDeg = outerAngle;
+                _flSteerDeg = sign * innerAngle;
+                _frSteerDeg = sign * outerAngle;
             }
         }
 
