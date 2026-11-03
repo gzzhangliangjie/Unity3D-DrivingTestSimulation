@@ -60,6 +60,8 @@ public class HardwareInputController : MonoBehaviour
     public KeyCode turnLeftKey = KeyCode.Q;
     [Tooltip("右转向灯（按一次开，再按关）")]
     public KeyCode turnRightKey = KeyCode.E;
+    [Tooltip("双闪 / 危险报警闪光灯（按一次开，再按关）")]
+    public KeyCode hazardKey = KeyCode.F;
 
     [Header("===== 键盘模拟（没有方向盘时） =====")]
     [Tooltip("未检测到方向盘设备时，允许用键盘模拟：A/D(或方向键)转向，W(上)油门，S(下)/空格刹车，H 手刹")]
@@ -128,6 +130,7 @@ public class HardwareInputController : MonoBehaviour
         {
             if (Input.GetKeyDown(turnLeftKey)) _turnLight.SetLeft();
             else if (Input.GetKeyDown(turnRightKey)) _turnLight.SetRight();
+            else if (Input.GetKeyDown(hazardKey)) _turnLight.SetExigency();
         }
     }
 
