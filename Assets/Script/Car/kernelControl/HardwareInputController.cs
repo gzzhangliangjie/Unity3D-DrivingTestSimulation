@@ -45,6 +45,22 @@ public class HardwareInputController : MonoBehaviour
     [Tooltip("整体启用开关")]
     public bool enableHardwareInput = true;
 
+    [Header("===== 键盘功能键（档位 / 转向灯，与设备无关） =====")]
+    [Tooltip("关闭后档位与转向灯只能用屏幕按钮")]
+    public bool enableKeyboardShortcuts = true;
+    [Tooltip("P 档")]
+    public KeyCode gearPKey = KeyCode.Alpha1;
+    [Tooltip("R 档（倒车）")]
+    public KeyCode gearRKey = KeyCode.Alpha2;
+    [Tooltip("N 档（空挡）")]
+    public KeyCode gearNKey = KeyCode.Alpha3;
+    [Tooltip("D 档（前进）")]
+    public KeyCode gearDKey = KeyCode.Alpha4;
+    [Tooltip("左转向灯（按一次开，再按关）")]
+    public KeyCode turnLeftKey = KeyCode.Q;
+    [Tooltip("右转向灯（按一次开，再按关）")]
+    public KeyCode turnRightKey = KeyCode.E;
+
     [Header("===== 键盘模拟（没有方向盘时） =====")]
     [Tooltip("未检测到方向盘设备时，允许用键盘模拟：A/D(或方向键)转向，W(上)油门，S(下)/空格刹车，H 手刹")]
     public bool keyboardFallback = true;
@@ -56,11 +72,15 @@ public class HardwareInputController : MonoBehaviour
     private float _kbSteer = 0f;          // 键盘模拟的转向量 -1..1
     private float _kbHoldTimer = 0f;      // 松键后保持接管一小段时间，避免和 UI 打架
     private Car_HandleBrake _handleBrake; // 手刹组件（UI 图标 + 音效都在它身上）
+    private GearsDangWei_Control _gears;  // 档位控制
+    private TurnLight _turnLight;         // 转向灯
 
     private void Start()
     {
         _kernel = FindObjectOfType<DrivingKernel>();
         _handleBrake = FindObjectOfType<Car_HandleBrake>();
+        _gears = FindObjectOfType<GearsDangWei_Control>();
+        _turnLight = FindObjectOfType<TurnLight>();
         RefreshDeviceState();
     }
 
@@ -71,8 +91,9 @@ public class HardwareInputController : MonoBehaviour
 
         RefreshDeviceState();
 
-        //手刹与设备是否接入无关：硬件键和键盘 H 都能用
+        //手刹、档位、转向灯与设备是否接入无关：键盘键和硬件键都能用
         HandleHandbrake();
+        HandleShortcuts();
 
         if (DeviceConnected)
         {
@@ -81,6 +102,32 @@ public class HardwareInputController : MonoBehaviour
         else if (keyboardFallback)
         {
             UpdateKeyboardInput();
+        }
+    }
+
+    /// <summary>
+    /// 档位（1/2/3/4 直选 P/R/N/D）与转向灯（Q 左 / E 右）。
+    /// 走的是原项目 UI 按钮绑定的同一批公开方法，UI 图标和动画会自动同步。
+    /// </summary>
+    private void HandleShortcuts()
+    {
+        if (!enableKeyboardShortcuts)
+            return;
+
+        if (_gears == null)
+            _gears = FindObjectOfType<GearsDangWei_Control>();
+        if (_turnLight == null)
+            _turnLight = FindObjectOfType<TurnLight>();
+
+        if (Input.GetKeyDown(gearPKey) && _gears != null) _gears.P();
+        else if (Input.GetKeyDown(gearRKey) && _gears != null) _gears.R();
+        else if (Input.GetKeyDown(gearNKey) && _gears != null) _gears.N();
+        else if (Input.GetKeyDown(gearDKey) && _gears != null) _gears.D();
+
+        if (_turnLight != null)
+        {
+            if (Input.GetKeyDown(turnLeftKey)) _turnLight.SetLeft();
+            else if (Input.GetKeyDown(turnRightKey)) _turnLight.SetRight();
         }
     }
 

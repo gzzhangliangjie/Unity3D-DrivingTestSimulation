@@ -32,77 +32,37 @@ public class GearsDangWei_Control : MonoBehaviour
 
     public void P()
     {
-        if (flag)//如果已经是P档
-        {
-            return;
-        }
-        else
-        {
-            gears = currentGears.P;
-            flag = true;
-        }
-        iTween.MoveTo(GearLever, iTween.Hash(
-            "position", P_point.position,
-            "time", Sleep,
-            "easetype", type,
-            "oncomplete", "Fun",//Fun回调函数名字
-            "oncompletetarget", gameObject
-        ));
+        SwitchTo(currentGears.P, P_point);
     }
     public void R()
     {
-        if (flag)
-        {
-            return;
-        }
-        else
-        {
-            gears = currentGears.R;
-            flag = true;
-        }
-        iTween.MoveTo(GearLever, iTween.Hash(
-            "position", R_point.position,
-            "time", Sleep,
-            "easetype", type,
-            "oncomplete", "Fun",
-            "oncompletetarget", gameObject
-        ));
+        SwitchTo(currentGears.R, R_point);
     }
     public void N()
     {
-        if (flag)
-        {
-            return;
-        }
-        else
-        {
-            gears = currentGears.N;
-            flag = true;
-        }
-        iTween.MoveTo(GearLever, iTween.Hash(
-            "position", N_point.position,
-            "time", Sleep,
-            "easetype", type,
-            "oncomplete", "Fun",
-            "oncompletetarget", gameObject
-        ));
+        SwitchTo(currentGears.N, N_point);
     }
     public void D()
     {
-        if (flag)
-        {
-            return;
-        }
-        else
-        {
-            gears = currentGears.D;
-            flag = true;
-        }
+        SwitchTo(currentGears.D, D_point);
+    }
+
+    /// <summary>
+    /// 切换档位。原来四个方法里各有一句 "if (flag) return;"，
+    /// 换档动画（默认 1 秒）播放期间的所有点击/按键会被直接吞掉，
+    /// 键盘 1~4 连按时体感就是"按了没反应"。
+    /// 这里改成打断上一次动画、以最后一次输入为准。
+    /// </summary>
+    private void SwitchTo(currentGears target, Transform point)
+    {
+        gears = target;
+        flag = true;
+        iTween.Stop(GearLever);
         iTween.MoveTo(GearLever, iTween.Hash(
-            "position", D_point.position,
+            "position", point.position,
             "time", Sleep,
             "easetype", type,
-            "oncomplete", "Fun",
+            "oncomplete", "Fun",//Fun回调函数名字
             "oncompletetarget", gameObject
         ));
     }
