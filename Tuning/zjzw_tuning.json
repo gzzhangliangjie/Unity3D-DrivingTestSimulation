@@ -1,0 +1,33 @@
+{
+  "repeat": 3,
+  "timeScale": 1.0,
+  "candidates": [
+    {
+      "id": 301,
+      "note": "默认几何闭环（窗口 3.2m，无额外偏移）——验证可重复性",
+      "entryZ": -33.5,
+      "cornerX": 33.0,
+      "radius": 3.33,
+      "arcStep": 30,
+      "exitEndZ": -19.2,
+      "lookForward": 3.0,
+      "steerGain": 2.4,
+      "steerSpeedFwd": 2.4,
+      "arriveDist": 2.2,
+      "throttleMax": 0.8,
+      "lockArc": true,
+      "lockLead": 0.8,
+      "lockSpeed": 4.0,
+      "lockSteer": -1.0,
+      "releaseYaw": 6,
+      "dynamicRoute": true,
+      "routeEntryOffset": 0.0,
+      "routeTurnBias": 0.0,
+      "routeRadiusMax": 3.2,
+      "vApproach": 9,
+      "vCorner": 6,
+      "vExit": 9,
+      "maxRoundSeconds": 45
+    }
+  ]
+}

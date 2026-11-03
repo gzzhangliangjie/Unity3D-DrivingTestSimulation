@@ -104,3 +104,76 @@ EasyDriving 的模块化车辆架构（`Engine/Transmission/Chassis/Steering` �
 - 倒车入库/侧方停车/半坡起步：路径为按库位坐标（Point_garage / Point_left / Point_right）推算的**估算值**，实测压线/撞角时直接改 `DemoDriver.cs` 里 `BuildDcrkPath()` / `BuildCftcPath()` / `BuildBpqbPath()` 的坐标（X/Z 世界坐标，每个点都有注释说明用途）
 - 半坡爬坡无力时，把 `UpdateRun()` 里油门上限 `0.8f` 再调大
 - 演示中被扣 100 分会像真实考试一样弹「不合格」并暂停，按 R 重开即可
+
+## 七、直角转弯自动调参工具（ZjzwTuner + tune_zjzw.py，2026-11-03 新增）
+
+调直角转弯演示参数时，"改 .cs → Unity 重编译 → 域重载 → 正在跑的演示被打断 → 重进项目再点演示"太浪费。
+本工具把参数全部**外部化到项目根 `Tuning/` 目录**（在 Assets 外，Unity 不导入、不触发重编译），
+Unity 里**只需开一次工程**，批量自动重试并把结果落盘，Python 侧分析选出最优参数。
+
+### 组件
+| 文件 | 作用 |
+|---|---|
+| `Assets/Script/MainGUI/Tutorial/ZjzwTuner.cs` | 常驻调参循环器：按 T 启停批次；每轮热加载 `Tuning/zjzw_tuning.json` → 注入 DemoDriver → 自动演示 → 结果追加写 `Tuning/zjzw_results.jsonl` → 自动重载 Exam Mode 进下一轮 |
+| `DemoDriver.cs`（改造） | 路径跟踪 const 参数改为可注入字段；`BuildZjzwPath()` 由参数程序化生成；调参轮失败检测（扣分/结算暂停/超时/卡死）+ 轨迹采样（0.25s）+ 与参考路径最大偏差统计 |
+| `Tuning/tune_zjzw.py` | `gen`（随机生成候选）/ `best`（按合格率>偏差>用时排名，导出 `zjzw_best.json`）/ `plot`（轨迹 SVG 对比图 `zjzw_plot.svg`）/ `reset`（清空结果重跑） |
+| `Tuning/zjzw_tuning.json` | 候选参数批次配置（12 组默认候选：基线组 + 前瞻/增益/半径/打方向时机/弯速单变量 + 组合组） |
+
+### 闭环用法（只开一次工程）
+1. `python Tuning/tune_zjzw.py gen`（或手改 `zjzw_tuning.json`）
+2. Unity 打开工程 → 考试模式 → 直角转弯单项练习 → **按 T**：批次自动连续跑（候选 × repeat 轮），
+   期间外部改 `zjzw_tuning.json` 下一轮立即生效，**不要改 .cs**（会域重载打断批次）
+3. `python Tuning/tune_zjzw.py best` → 最优参数导出到 `zjzw_best.json`（贴回 candidates 精调，或固化进 `BuildZjzwPath` 默认值）
+4. `python Tuning/tune_zjzw.py plot` 看轨迹对比
+5. 重跑批次前 `python Tuning/tune_zjzw.py reset`
+
+### 设计要点
+- 每轮结束**重载 Exam Mode 场景**复位（而非原地复位）：压线墙撞后被 `Wall.cs` 销毁、分数/结算面板/
+  项目 30s 计时器只有场景重建才能 100% 复位；`SelectPass` 是跨场景单例，sites 保持直角转弯
+- 失败判定直接用真实考试反馈：分数从本轮初始值下降（压线/中途停车/超时都扣 100）→ 记失败；
+  到达路径终点 → 记成功。不依赖旁路判定，调出来的参数天然满足考试规则
+- `MyGameManager` 结算触发的 `timeScale=0`/结算面板由工具在同一帧内恢复，批次不会卡死
+- 调参轮中 G/R 键被忽略（防人工干预丢数据）；批次结束自动恢复
+- 域重载（改代码/重编译）会打断批次，但进度从 `zjzw_results.jsonl` 行数恢复，按 T 续跑剩余轮次
+
+## 八、直角转弯·几何闭环路线（ZjzwRoute，2026-11-03 新增）
+
+**背景**：旧的固定提前量方案（`cornerX - lockLead` 到点打死）实测早打 0.87m，弧心西移 1m，车身左前角蹭内侧直角墙；12 组参数全在 (32.9,-32.9) 扣 100 分，轨迹完全一致（说明是几何错，不是参数没调好）。
+
+**做法**（`Assets/Script/MainGUI/Tutorial/ZjzwRoute.cs`）：不再"到某个 x 就打死"，改为每帧按真实位姿反解：
+
+```
+左转 90° 落点几何：R = (exitX - x) / (1 - cos yaw)
+方向盘转角：      δ = atan(wheelBase / R)，归一化 = δ / steerAngle
+```
+
+- `R` 大于窗口上限 → 说明还没到转弯点（或已被顶偏），沿入口道中线走，绝不提前画弧；
+- `R` 落在窗口内 → 按 `R` 打方向（这个式子逐帧自洽，偏离会在下一帧被拉回来）；
+- `R` 小于满舵最小半径（3.33m）→ 判"打晚了"，打满并在出口段纠偏；
+- 航向已转过 30° 后几何退化，不再凑落点，改为打完这一把方向 + 出口道中线收口（前瞻 5m）；
+- 每次判级变化打一条 `[ROUTE] 动态调整#n：原因 pos/yaw/Rreq/cte`，可直接看出它为什么改路线。
+
+**几何真值**（从 Exam Mode 场景压线墙实测，别再手调）：入口道中心 z=-33.48（墙 -35.35/-31.6）、出口道中心 x=36.42（墙 34.41/38.44）、内侧直角点 (34.4,-31.6)。
+
+**实测**（ZjzwAutoRunner 无人值守跑批，`Logs/zjzw_rep6.log`、`Logs/zjzw_exit5.log`）：9 轮 9 通过、均 100 分、单轮 13.5s；出弯横向落点 x=36.6（离中线 0.18m）。对比修复前 12/12 失败。
+
+**三个标定量**（`ZjzwTune` 里可热注入，默认值已实测可用，一般不用动）：`routeRadiusMax=3.2`（转弯窗口半径上限，3.6 会早打内切）、`routeEntryOffset`（入口贴外线，米）、`routeTurnBias`（落点东移，米）。`dynamicRoute=false` 可切回旧的固定提前量方案做对照。
+
+### 八·1 最终定版参数（id=301，编辑器实跑 3/3 通过，2026-11-03 19:55）
+
+```
+dynamicRoute     = true     // 几何闭环路线（核心开关）
+routeRadiusMax   = 3.2      // 转弯窗口半径上限（3.6 会早打内切压线，勿越 3.5）
+routeEntryOffset = 0.0      // 入口贴外线偏移（米）
+routeTurnBias    = 0.0      // 落点东移补偿（米）
+
+// 以下为常规跟踪/车速参数（配合几何闭环）
+cornerX=33.0  entryZ=-33.5  exitEndZ=-19.2  radius=3.33
+vApproach=9  vCorner=6  vExit=9  throttleMax=0.8
+steerGain=2.4  steerSpeedFwd=2.4  lookForward=3.0  arriveDist=2.2
+releaseYaw=6  maxRoundSeconds=45
+```
+
+实测成绩：3 轮全过、均 100 分、13.5s/轮、终点点 (36.6,-23.5) yaw=0（正东），三轮轨迹完全一致。
+`Tuning/zjzw_tuning.json` 即当前定版配置；跑批复现：`touch Tuning/zjzw_autostart.flag` + Play（或命令行 -autoZjzw）。
+编辑器内远程触发：写 `Tuning/zjzw_editorplay.flag` → ZjzwWatchRunner 自动进 Play，跑完自动停。

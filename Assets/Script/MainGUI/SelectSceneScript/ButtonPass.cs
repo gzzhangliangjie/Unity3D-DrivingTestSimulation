@@ -9,6 +9,7 @@ public class ButtonPass : MonoBehaviour, IPointerUpHandler
     public SelectPass.Sites sites = SelectPass.Sites.Dcrk;
     public void OnPointerUp(PointerEventData eventData)
     {
+        Debug.Log("[NAV] ButtonPass 被点击：go=" + gameObject.name + " sites=" + sites);
         SelectPass sp = FindObjectOfType<SelectPass>();
         sp.sites = sites;
         SelectScene ss = FindObjectOfType<SelectScene>();

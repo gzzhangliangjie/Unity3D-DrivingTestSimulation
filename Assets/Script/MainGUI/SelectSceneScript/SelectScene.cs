@@ -21,6 +21,12 @@ public class SelectScene : MonoBehaviour
     /// </summary>
     public void Scene_ExamMode()
     {
+        SelectPass sp = FindObjectOfType<SelectPass>();
+        Debug.Log("[NAV] Scene_ExamMode 被调用，sites=" + (sp != null ? sp.sites.ToString() : "<无SelectPass>")
+#if UNITY_EDITOR
+            + "\n" + System.Environment.StackTrace
+#endif
+        );
         Globe.loadM = Globe.LoadMode.Slow;
         Globe.nextSceneName = "Exam Mode";
         SceneManager.LoadScene("Loading");
