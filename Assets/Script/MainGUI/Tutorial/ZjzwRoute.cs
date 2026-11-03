@@ -40,9 +40,9 @@ public class ZjzwRouteCfg
     public float wheelBase = 2.6f;     // 轴距（DrivingKernel.wheelBase）
     public float maxSteerDeg = 38f;    // 满舵车轮转角（DrivingKernel.steerAngle）
     public float radiusMax = 3.2f;     // 允许的最大转弯半径（再大就说明还不到转弯窗口）；实测 3.6 会早打 0.4m 内切
-    public float vEntry = 9f;          // 入口直道车速
-    public float vCorner = 6f;         // 弯中车速
-    public float vExit = 9f;           // 出口直道车速
+    public float vEntry = 6f;          // 入口直道车速（匀速原则：考试不主动加速，全程恒定弯速）
+    public float vCorner = 6f;         // 弯中车速（= 标定弯速：满舵侧偏在此速度下标定，弧线可复现）
+    public float vExit = 6f;           // 出口直道车速
     public float laneGain = 0.16f;     // 车道保持增益（度误差 → 归一化转向比例）
     public float turnDoneYaw = 30f;    // 航向小于该值视为已出弯（度）：交回出口道中线跟踪
 
@@ -102,7 +102,7 @@ public static class ZjzwRoute
                 // 出弯后再按出口道中线纠偏——不要为了凑落点回正方向（那是原地画龙）
                 o.phase = RoutePhase.Turn;
                 o.steer = -SteerForRadius(rMin, c);
-                o.speed = Mathf.Min(c.vCorner, 5f);
+                o.speed = c.vCorner;               // 弯中匀速：不再压到 5（低侧偏内切撞墙的元凶之一）
                 o.cte = pos.x - c.exitX;
                 o.note = "弯中改出口优先：继续打满，出弯收线";
             }

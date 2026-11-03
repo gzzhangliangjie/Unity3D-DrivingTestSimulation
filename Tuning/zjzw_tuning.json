@@ -3,8 +3,8 @@
   "timeScale": 1.0,
   "candidates": [
     {
-      "id": 301,
-      "note": "默认几何闭环（窗口 3.2m，无额外偏移）——验证可重复性",
+      "id": 401,
+      "note": "定版：全程恒速6.5 + 入弯贴右0.35m（靠右预留内角余量）",
       "entryZ": -33.5,
       "cornerX": 33.0,
       "radius": 3.33,
@@ -21,13 +21,14 @@
       "lockSteer": -1.0,
       "releaseYaw": 6,
       "dynamicRoute": true,
-      "routeEntryOffset": 0.0,
+      "routeEntryOffset": 0.35,
       "routeTurnBias": 0.0,
       "routeRadiusMax": 3.2,
-      "vApproach": 9,
-      "vCorner": 6,
-      "vExit": 9,
-      "maxRoundSeconds": 45
+      "vApproach": 6.5,
+      "vCorner": 6.5,
+      "vExit": 6.5,
+      "maxRoundSeconds": 45,
+      "repeat": 2
     }
   ]
 }

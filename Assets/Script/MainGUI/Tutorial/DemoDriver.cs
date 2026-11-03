@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 using UnityEngine.UI;
@@ -37,7 +37,17 @@ public class DemoDriver : MonoBehaviour
     private float _lookReverse = 2.6f;   // 倒车纯跟踪前瞻距离（倒车精度要求高）
     private float _steerGain = 2.4f;     // 纯跟踪转向增益（角度误差 → 归一化转向）
     private float _steerSpeedFwd = 2.4f; // 前进时方向盘转动速率（归一化/秒）
+    [System.NonSerialized] public float _crossGain = 1.1f; // Stanley 横向误差增益（偏移米数 → 额外打角），调参器可覆盖
     private float _throttleMax = 0.8f;   // 油门上限（半坡爬坡无力时调大）
+
+    // ---- 路径跟踪增强（参考 Unity Standard Assets CarAIControl / WaypointProgressTracker）----
+    private float _lookSpeedGain = 0.5f;  // 速度自适应前瞻增益（米前瞻 / (米/秒)）：直道随车速拉长前瞻压画龙
+    private float _lookCurveGate = 0.30f; // 曲率前馈舵量门槛：|ff| 低于它才放行自适应前瞻（弯道保持基础前瞻防切内侧）
+    private float _aheadScanDist = 10f;   // 急弯限速的前方扫描距离（米）
+    private float _capAngleMin = 20f;     // 前方累计转角低于该值不限速（度）
+    private float _capAngleMax = 80f;     // 前方累计转角达到该值时限到最低速（度）
+    private float _capSpeedHigh = 12f;    // 转角限速上限（高于所有分段车速 = 缓弯/直道不干预）
+    private float _capSpeedLow = 7f;     // 转角限速下限：必须高于恒速目标 6.5，否则会把弯中速度钳回 6 → 内切撞墙（2026-11-04 教训）
 
     // ---- 直角转弯·转角打满控制（驾校打法：车头到横线打死 → 保持 → 车身转正后回正）----
     // 为什么不用纯跟踪过弯：R=3.33 = 轴距2.6/tan38° 正好是满舵最小转弯半径，零余量；
@@ -93,6 +103,9 @@ public class DemoDriver : MonoBehaviour
     private DemoState _state = DemoState.Idle;
     private DrivePhase _phase = DrivePhase.Run;
     private float _steer;           // 当前归一化转向输入 -1..1
+    private float _steerTargetSmooth; // 转向目标低通滤波值（抑制前瞻点跨段跳变导致的方向盘抖动）
+    private float _driveTime;         // 本轮演示已行驶时长（起步斜坡用：起步 1s 内限制转向幅度）
+    private float _lastFF;            // 最近一帧的曲率前馈舵量（遥测诊断用）
     private float _logTimer = 0f;   // 调试遥测计时（调完删）
     private bool _gearReverse;      // 当前档位是否 R（倒车）
     private bool _leftStart;        // 是否已离开起点区域（防止起步当帧跳点）
@@ -109,6 +122,7 @@ public class DemoDriver : MonoBehaviour
     // ============================================================
     [System.NonSerialized] public bool tuningMode;          // 当前是否处于调参轮（由 ZjzwTuner 置位）
     [System.NonSerialized] public ZjzwTune appliedTune;     // 本轮注入的调参参数（null = 用内置默认值）
+    [System.NonSerialized] public QxxsTune appliedQxxsTune; // 曲线行驶调参参数（QxxsTuner 注入；null = 用内置默认值）
     [System.NonSerialized] public bool roundFinished;       // 本轮已结束（ZjzwTuner 轮询此标志）
     [System.NonSerialized] public ZjzwRoundResult lastResult; // 本轮结果（结束时机体写入）
 
@@ -245,6 +259,11 @@ public class DemoDriver : MonoBehaviour
                 EndTuningRound("timeout");
                 return;
             }
+            if (appliedQxxsTune != null && Time.time - _roundStartTime > appliedQxxsTune.maxRoundSeconds)
+            {
+                EndTuningRound("timeout");
+                return;
+            }
         }
 
         if (_state == DemoState.Driving)
@@ -319,6 +338,8 @@ public class DemoDriver : MonoBehaviour
 
         // 5) 初始化控制状态
         _steer = 0f;
+        _steerTargetSmooth = 0f;
+        _driveTime = 0f;
         _stuckTimer = 0f;
         _wpIndex = 0;
         _stepIndex = 0;
@@ -393,7 +414,7 @@ public class DemoDriver : MonoBehaviour
         _phase = DrivePhase.BrakeToStop;
     }
 
-    /// <summary>正常行驶：路径推进 + 纯跟踪转向 + 分段限速 + 卡死看门狗</summary>
+    /// <summary>正常行驶：路径推进 + 纯跟踪转向（速度自适应前瞻）+ 分段限速/前方转角限速 + 卡死看门狗</summary>
     private void UpdateRun()
     {
         Vector3 pos = transform.position;
@@ -502,14 +523,53 @@ public class DemoDriver : MonoBehaviour
         }
         if (!steerByLock)
         {
-        float look = _gearReverse ? _lookReverse : _lookForward;
-        Vector3 target = LookaheadPoint(pos, look);
+        _driveTime += Time.deltaTime;
+        // 横向误差（Stanley 项）：车偏出路径时按偏移量直接反打方向。
+        // 0.15m 内线性淡入——贴线时完全交给纯跟踪，避免两套修正互搏形成振荡回路（方向盘大幅甩动）；
+        // 偏出 0.15m 后纠偏全权介入，偏差一出现（不用等碰到边线）就开始快速回正
+        Vector3 projPt; int projSeg;
+        float crossErr = ProjectOnPath(pos, out projPt, out projSeg);
+        float errFactor = Mathf.Clamp01(Mathf.Abs(crossErr) / 0.5f); // 偏 0.5m 时响应拉满
+        // 曲率前馈先算：既给转向用，也充当速度自适应前瞻的直/弯判据
+        float ff = (!_gearReverse && _wps != null && _wps.Length > 1) ? SteerFeedforward(projPt, projSeg) : 0f;
+        _lastFF = ff;
+        // 速度自适应前瞻（Standard Assets 思路：跑得快看得远）——直道上前瞻随车速拉长压住画龙，
+        // 弯道（前馈舵量超门槛）保持基础前瞻，防止前瞻一大提前切弯内侧
+        float lookFwd = _lookForward;
+        float ffAbs = Mathf.Abs(ff);
+        if (!_gearReverse && ffAbs < _lookCurveGate)
+        {
+            float curveAuth = Mathf.Clamp01((_lookCurveGate - ffAbs) / _lookCurveGate); // 1=直道 → 0=接近门槛
+            lookFwd += _lookSpeedGain * Mathf.Max(_kernel.speed / 3.6f, 0f) * curveAuth;
+        }
+        Vector3 target = LookaheadPoint(pos, _gearReverse ? _lookReverse : lookFwd);
         Vector3 local = transform.InverseTransformPoint(target);
         float ang;
         if (_gearReverse) ang = Mathf.Atan2(local.x, Mathf.Max(-local.z, 0.15f));
         else ang = Mathf.Atan2(local.x, Mathf.Max(local.z, 0.15f));
         float steerTarget = Mathf.Clamp(ang * _steerGain, -1f, 1f);
-        float steerSpeed = _gearReverse ? 3.2f : _steerSpeedFwd; // 倒车打死要更快（入库时机短）
+        if (!_gearReverse && _wps.Length > 1)
+        {
+            float vMps = Mathf.Max(_kernel.speed / 3.6f, 1.2f); // m/s
+            float auth = Mathf.Clamp01(Mathf.Abs(crossErr) / 0.15f);
+            steerTarget += -Mathf.Atan2(_crossGain * crossErr, vMps) * auth; // 偏右 → 向左补，偏左 → 向右补
+            steerTarget += ff;
+            steerTarget = Mathf.Clamp(steerTarget, -1f, 1f);
+        }
+        // 起步斜坡：起步 1 秒内限制转向幅度，防止瞬态尖峰把车甩出路径（甩出去再拉回来 = 方向盘猛甩）
+        if (_driveTime < 1f) steerTarget = Mathf.Clamp(steerTarget, -0.35f, 0.35f);
+        // 方向盘稳化（自适应）：贴线巡航重滤波压抖动；主动转向或纠偏时滤波自动加速，
+        // 消除相位滞后——滞后正是大角度转向时振荡的根源。
+        // resp 关键量 = 方向盘需要走的距离 |目标-当前|：过切点从左舵摆到右舵的瞬间
+        // 目标值过零，若按 |目标| 大小定 resp 会在变向时刻反而降到最慢（第二弯跪的根因）
+        float swing = Mathf.Abs(steerTarget - _steer);
+        float resp = Mathf.Max(errFactor, Mathf.Clamp01(swing * 2.5f));
+        float dead = Mathf.Lerp(0.03f, 0.012f, errFactor);
+        if (Mathf.Abs(steerTarget) < dead) steerTarget = 0f;
+        float lp = Mathf.Lerp(4f, 12f, resp);
+        _steerTargetSmooth = Mathf.Lerp(_steerTargetSmooth, steerTarget, 1f - Mathf.Exp(-lp * Time.deltaTime));
+        steerTarget = _steerTargetSmooth;
+        float steerSpeed = _gearReverse ? 3.2f : Mathf.Lerp(_steerSpeedFwd, 5f, resp); // 主动转向时打舵提速
         _steer = Mathf.MoveTowards(_steer, steerTarget, steerSpeed * Time.deltaTime);
         _kernel.Hardware_SetSteering(_steer);
         }
@@ -517,13 +577,19 @@ public class DemoDriver : MonoBehaviour
         // 4) 速度控制（分段目标车速，急弯自动降速；几何闭环阶段用路线给的目标车速）
         float vTarget = _speeds[Mathf.Clamp(_wpIndex, 0, _speeds.Length - 1)];
         if (_routeSpeed >= 0f) vTarget = _routeSpeed;
-        if (Mathf.Abs(_steer) > 0.5f) vTarget = Mathf.Min(vTarget, 6f);
+        vTarget = Mathf.Min(vTarget, CornerSpeedCap(pos)); // 前方转角限速：统一生效（几何闭环管转向，限速管车速，互不冲突）
+        if (Mathf.Abs(_steer) > 0.5f) vTarget = Mathf.Min(vTarget, 7f); // 打舵限速兜底：须高于恒速 6.5，否则满舵段被钳回 6 → 低侧偏内切
         float v = _kernel.speed;
         float throttle = 0f;
         float brake = 0f;
-        if (v < vTarget - 1f)
+        // 油门死区：路线模式（匀速）用 0.2 小死区——1.0 大死区会让匀速滑行掉到 vTarget-1，
+        // 直角转弯弯中掉到 5.0 → 侧偏变小 → 弧线收紧内切撞墙（2026-11-03 实测教训）。
+        // 路线模式油门增益/下限加大：满舵死弯滚动阻力大，弱油门顶不住 6.5 会重新掉速内切（2026-11-04 实测）
+        bool routeMode = _routeSpeed >= 0f;
+        float throttleDb = routeMode ? 0.2f : 1f;
+        if (v < vTarget - throttleDb)
         {
-            throttle = Mathf.Clamp((vTarget - v) * 0.35f, 0.2f, _throttleMax);
+            throttle = Mathf.Clamp((vTarget - v) * (routeMode ? 0.6f : 0.35f), routeMode ? 0.35f : 0.2f, _throttleMax);
         }
         else if (v > vTarget + 2f)
         {
@@ -571,9 +637,9 @@ public class DemoDriver : MonoBehaviour
         if (_logTimer <= 0f)
         {
             _logTimer = 0.5f;
-            Debug.Log(string.Format("[DEMO] pos=({0:F1},{1:F1}) yaw={2:F0} wp={3}/{4} steer={5:F2} v={6:F1} gearRev={7} distWp={8:F1} throttle={9:F2} lock={10}",
+            Debug.Log(string.Format("[DEMO] pos=({0:F1},{1:F1}) yaw={2:F0} wp={3}/{4} steer={5:F2} ff={6:F2} v={7:F1} gearRev={8} distWp={9:F1} throttle={10:F2} lock={11}",
                 pos.x, pos.z, transform.eulerAngles.y, _wpIndex, _wps.Length - 1,
-                _steer, v, _gearReverse, FlatDist(pos, _wps[_wpIndex]), throttle, _inLock));
+                _steer, _lastFF, v, _gearReverse, FlatDist(pos, _wps[_wpIndex]), throttle, _inLock));
         }
     }
 
@@ -653,15 +719,89 @@ public class DemoDriver : MonoBehaviour
         }
     }
 
-    /// <summary>从车辆当前位置沿路径向前找 look 米处的目标点</summary>
-    private Vector3 LookaheadPoint(Vector3 pos, float look)
+    /// <summary>Catmull-Rom 样条重采样：把折线拐点圆滑成连续曲线（0.4m 步长），消除前瞻点跨段跳变</summary>
+    private static Vector3[] ResampleCatmullRom(Vector3[] pts, float step)
     {
-        // 1) 把车投影到路径折线上（只在当前目标点附近的几段内找，防止投到远处段）
+        int n = pts.Length;
+        if (n < 3) return pts;
+        var list = new System.Collections.Generic.List<Vector3>(n * 4);
+        for (int i = 0; i < n - 1; i++)
+        {
+            Vector3 p0 = pts[Mathf.Max(0, i - 1)], p1 = pts[i], p2 = pts[i + 1], p3 = pts[Mathf.Min(n - 1, i + 2)];
+            float segLen = Mathf.Sqrt((p2.x - p1.x) * (p2.x - p1.x) + (p2.z - p1.z) * (p2.z - p1.z));
+            int steps = Mathf.Max(1, Mathf.CeilToInt(segLen / step));
+            for (int s = 0; s < steps; s++)
+            {
+                float t = (float)s / steps, t2 = t * t, t3 = t2 * t;
+                float x = 0.5f * (2f * p1.x + (-p0.x + p2.x) * t + (2f * p0.x - 5f * p1.x + 4f * p2.x - p3.x) * t2 + (-p0.x + 3f * p1.x - 3f * p2.x + p3.x) * t3);
+                float z = 0.5f * (2f * p1.z + (-p0.z + p2.z) * t + (2f * p0.z - 5f * p1.z + 4f * p2.z - p3.z) * t2 + (-p0.z + 3f * p1.z - 3f * p2.z + p3.z) * t3);
+                list.Add(new Vector3(x, 0f, z));
+            }
+        }
+        list.Add(pts[n - 1]);
+        return list.ToArray();
+    }
+
+    /// <summary>
+    /// 曲率前馈：沿路径向前取 1.8/3.0/4.2m 三个点，用外接圆（Menger）曲率估算前方弯曲度，
+    /// 按稳态转向公式 δ = atan(轴距×曲率) 换算成舵量（除以满舵车轮转角）。
+    /// S 弯半径 ~7.5m 需要 δ≈19°（约半舵），纯跟踪反馈天生只给一半——弯中打不够、往外线漂就源于此。
+    /// 前瞻 3m 采样 = 提前约 1.5 秒开始给舵，实现「根据弯曲度提前打方向」。
+    /// </summary>
+    private float SteerFeedforward(Vector3 projPt, int projSeg)
+    {
+        int n = _wps.Length;
+        if (n < 4) return 0f;
+        // 航向角增量法：取投影点前方 ~2m 窗口，窗口两端方向向量的夹角 = 该段累计转角。
+        // 弯道交接处（左弯→右弯）窗口内左右转角互相抵消，前馈平滑过零——
+        // 旧版三点外接圆（1.8/3.0/4.2m）在交接处会横跨符号翻转，算出虚假大曲率，
+        // 导致「上一个弯还没转完就猛打下一个弯的方向」。
+        const float window = 2.0f;
+        Vector3 dir0 = Vector3.zero, dirEnd = Vector3.zero, prev = projPt;
+        bool have0 = false;
+        float s = 0f;
+        for (int i = projSeg; i < n - 1; i++)
+        {
+            Vector3 cur = _wps[i + 1];
+            float d = FlatDist(prev, cur);
+            if (d > 0.0001f)
+            {
+                if (!have0)
+                {
+                    dir0 = new Vector3((cur.x - prev.x) / d, 0f, (cur.z - prev.z) / d);
+                    have0 = true;
+                }
+                if (s + d >= window)
+                {
+                    float t = (window - s) / d;
+                    dirEnd = new Vector3(Mathf.Lerp(prev.x, cur.x, t) - prev.x, 0f, Mathf.Lerp(prev.z, cur.z, t) - prev.z);
+                    float le = dirEnd.magnitude;
+                    if (le > 0.0001f) { dirEnd /= le; s = window; }
+                    break;
+                }
+                s += d;
+                dirEnd = new Vector3((cur.x - prev.x) / d, 0f, (cur.z - prev.z) / d);
+            }
+            prev = cur;
+        }
+        if (!have0 || s < window * 0.75f) return 0f; // 窗口不足 3/4（路径末端）不做前馈，防止末端曲率失真
+        float cross = dir0.x * dirEnd.z - dir0.z * dirEnd.x; // 单位向量叉积 = sin(夹角)，>0 = 左转
+        float dHeading = Mathf.Asin(Mathf.Clamp(cross, -1f, 1f)); // 窗口内累计转角（弧度）
+        float kappa = Mathf.Abs(dHeading) / window;               // 平均曲率 1/m
+        if (kappa < 0.005f) return 0f;                            // 近似直线不前馈
+        float deg = Mathf.Atan(_kernel.wheelBase * kappa) * Mathf.Rad2Deg;
+        return -Mathf.Sign(dHeading) * deg / Mathf.Max(_kernel.steerAngle, 1f);
+    }
+
+    /// <summary>把车投影到当前路径段附近，返回最近投影点和段索引（out），并返回带符号横向偏移（正 = 车在路径前进方向右侧）</summary>
+    private float ProjectOnPath(Vector3 pos, out Vector3 bestPt, out int bestSeg)
+    {
         int firstSeg = Mathf.Max(0, _wpIndex - 1);
         int lastSeg = Mathf.Min(_wps.Length - 2, _wpIndex + 2);
         float bestSqr = float.MaxValue;
-        Vector3 bestPt = _wps[firstSeg];
-        int bestSeg = firstSeg;
+        bestPt = _wps[firstSeg];
+        bestSeg = firstSeg;
+        float signed = 0f;
         for (int i = firstSeg; i <= lastSeg; i++)
         {
             Vector3 a = _wps[i];
@@ -677,8 +817,28 @@ public class DemoDriver : MonoBehaviour
             float px = a.x + abx * t, pz = a.z + abz * t;
             float dx = pos.x - px, dz = pos.z - pz;
             float sqr = dx * dx + dz * dz;
-            if (sqr < bestSqr) { bestSqr = sqr; bestPt = new Vector3(px, 0f, pz); bestSeg = i; }
+            if (sqr < bestSqr)
+            {
+                bestSqr = sqr;
+                bestPt = new Vector3(px, 0f, pz);
+                bestSeg = i;
+                if (len2 > 0.0001f)
+                {
+                    float inv = 1f / Mathf.Sqrt(len2);
+                    float dirx = abx * inv, dirz = abz * inv; // 段前进方向（归一化）
+                    signed = dirz * dx - dirx * dz;           // 叉积：正 = 车在路径右侧
+                }
+            }
         }
+        return signed;
+    }
+
+    /// <summary>从车辆当前位置沿路径向前找 look 米处的目标点</summary>
+    private Vector3 LookaheadPoint(Vector3 pos, float look)
+    {
+        // 1) 把车投影到路径折线上（复用 ProjectOnPath，同时拿到最近段索引）
+        Vector3 bestPt; int bestSeg;
+        ProjectOnPath(pos, out bestPt, out bestSeg);
 
         // 2) 从投影点沿路径（弧长）向前找 look 米处的目标点
         float remain = look;
@@ -698,6 +858,45 @@ public class DemoDriver : MonoBehaviour
             from = b;
         }
         return new Vector3(_wps[_wps.Length - 1].x, pos.y, _wps[_wps.Length - 1].z);
+    }
+
+    /// <summary>
+    /// 前方转角限速（Standard Assets CarAIControl 的 Cautious 思路）：
+    /// 沿路径向前扫 _aheadScanDist 米，累计航向变化绝对值，转角越大限速越低。
+    /// 分段车速表管的是"到哪一段降到多少"，这里是"看见弯就提前收油"的连续补充：
+    /// 上限 _capSpeedHigh 高于所有分段车速（缓弯/直道完全不干预），
+    /// 下限 _capSpeedLow 保证弯中仍有爬行速度（压太低会触发中途停车扣分）。
+    /// </summary>
+    private float CornerSpeedCap(Vector3 pos)
+    {
+        if (_wps == null || _wps.Length < 3) return _capSpeedHigh;
+        Vector3 bestPt; int bestSeg;
+        ProjectOnPath(pos, out bestPt, out bestSeg);
+        float remain = _aheadScanDist;
+        float total = 0f;
+        Vector3 prevDir = Vector3.zero;
+        bool hasDir = false;
+        Vector3 prev = bestPt; // 首段从投影点起算，避免起步位置抖动
+        for (int i = bestSeg; i < _wps.Length - 1 && remain > 0f; i++)
+        {
+            Vector3 b = _wps[i + 1];
+            float d = FlatDist(prev, b);
+            if (d > 0.001f)
+            {
+                Vector3 dir = new Vector3((b.x - prev.x) / d, 0f, (b.z - prev.z) / d);
+                if (hasDir)
+                {
+                    float dot = Mathf.Clamp(Vector3.Dot(prevDir, dir), -1f, 1f);
+                    total += Mathf.Acos(dot) * Mathf.Rad2Deg; // 相邻段夹角累计
+                }
+                prevDir = dir;
+                hasDir = true;
+            }
+            remain -= d;
+            prev = b;
+        }
+        float t = Mathf.Clamp01((total - _capAngleMin) / (_capAngleMax - _capAngleMin));
+        return Mathf.Lerp(_capSpeedHigh, _capSpeedLow, t);
     }
 
     // ============================================================
@@ -848,9 +1047,9 @@ public class DemoDriver : MonoBehaviour
         float radius = t != null ? t.radius : 3.33f;        // 圆弧半径（=轴距/tan38°，打死方向的转弯半径）
         float arcStep = t != null ? t.arcStep : 30f;        // 圆弧步进角（度）
         float exitEndZ = t != null ? t.exitEndZ : -19.2f;   // 出口终点 z（End 触发器前刹停）
-        float vApproach = t != null ? t.vApproach : 9f;     // 直道目标车速
-        float vCorner = t != null ? t.vCorner : 6f;         // 弯中目标车速
-        float vExit = t != null ? t.vExit : 9f;             // 出口直道目标车速
+        float vApproach = t != null ? t.vApproach : 6.5f;   // 入口直道目标车速（全程恒速 6.5：与 S 弯统一；弧线标定等效速度即 6.5）
+        float vCorner = t != null ? t.vCorner : 6.5f;       // 弯中目标车速
+        float vExit = t != null ? t.vExit : 6.5f;           // 出口直道目标车速
 
         // 几何闭环路线的真值（取自场景压线墙实测，比调参参数更可信）：
         //   入口道中心 z = (-35.35 + -31.6)/2 ≈ -33.48；出口道中心 x = (34.41 + 38.44)/2 ≈ 36.42
@@ -911,35 +1110,137 @@ public class DemoDriver : MonoBehaviour
         };
     }
 
-    /// <summary>曲线行驶：起点(41.7,111.0)朝北 → S弯（先左后右）→ 北向驶出（End 在 15.8,147.3）</summary>
+    // S 弯演示路径（世界坐标 x,z，行进方向：东入口臂 → 左弧 → 公切线 → 右弧 → 西出口臂）。
+    // 由 Tuning/gen_qxxs_arcpath.py 解析生成：对边线真值反推的中心线做双圆弧拟合
+    //（左弧 C1=(34.49,142.78) R1=7.01m，右弧 C2=(19.87,142.82) R2=7.21m，RMS<0.015m），
+    // 内公切线连接两弧，贴外偏移 0.4m 径向烘焙（入口/出口 5m 坡道渐入渐出），0.4m 步长采样。
+    // 解析路径曲率分段恒定，无折线伪影——替代旧「1.2m 折线+样条重采样」链路
+    //（旧链路的交接台阶与样条过冲是第二弯入口先错打、出口猛甩舵的根因）。
+    // 重新提取边线后：先跑 gen_qxxs_centerline.py 得中心线真值，再跑 gen_qxxs_arcpath.py 粘贴到这里。
+    //
+    // 【变方向关键边界点（解析切点，s=沿路径里程）】——打方向时机以此为准：
+    //   起点  (41.70,111.00) 朝北，全长 86.5m
+    //   s= 31.8m  A (41.89,143.19)  直道→左弧：开始向左打（前馈提前~1.5s 给舵）
+    //   s= 53.4m  B1(27.28,144.08)  左弧→切线：保持左舵过切点后回正
+    //   s= 56.8m  B2(27.17,140.65)  切线→右弧：回正后向右打一圈又1/4
+    //   s= 78.9m  D (12.28,143.23)  右弧→直道：出弯回正
+    private const string QxxsCenterline =
+        "41.70,111.40;41.69,111.80;41.69,112.21;41.69,112.61;41.69,113.01;41.68,113.41;41.68,113.82;41.68,114.22;41.68,114.62;41.67,115.02;" +
+        "41.67,115.42;41.67,115.83;41.67,116.23;41.66,116.63;41.66,117.03;41.66,117.44;41.66,117.84;41.65,118.24;41.65,118.64;41.65,119.05;" +
+        "41.65,119.45;41.64,119.85;41.64,120.25;41.64,120.65;41.64,121.06;41.63,121.46;41.63,121.86;41.63,122.26;41.63,122.67;41.62,123.07;" +
+        "41.62,123.47;41.62,123.87;41.62,124.27;41.61,124.68;41.61,125.08;41.61,125.48;41.61,125.88;41.60,126.29;41.60,126.69;41.60,127.09;" +
+        "41.60,127.49;41.59,127.90;41.59,128.30;41.59,128.70;41.59,129.10;41.58,129.50;41.58,129.91;41.58,130.31;41.58,130.71;41.57,131.11;" +
+        "41.57,131.52;41.57,131.92;41.57,132.32;41.56,132.72;41.56,133.12;41.56,133.53;41.56,133.93;41.55,134.33;41.55,134.73;41.55,135.14;" +
+        "41.55,135.54;41.54,135.94;41.54,136.34;41.54,136.75;41.54,137.15;41.53,137.55;41.54,137.95;41.57,138.35;41.60,138.76;41.63,139.16;" +
+        "41.66,139.56;41.69,139.96;41.72,140.37;41.75,140.77;41.78,141.17;41.81,141.57;41.84,141.98;41.87,142.38;41.90,142.78;41.89,143.19;" +
+        "41.86,143.59;41.80,143.99;41.72,144.39;41.62,144.79;41.50,145.17;41.36,145.55;41.20,145.93;41.02,146.29;40.81,146.64;40.59,146.98;" +
+        "40.35,147.31;40.10,147.62;39.82,147.92;39.53,148.21;39.23,148.48;38.91,148.73;38.58,148.96;38.23,149.18;37.87,149.37;37.51,149.55;" +
+        "37.13,149.70;36.75,149.84;36.36,149.95;35.96,150.04;35.56,150.11;35.16,150.16;34.75,150.18;34.35,150.19;33.94,150.17;33.54,150.13;" +
+        "33.14,150.07;32.74,149.98;32.35,149.87;31.96,149.75;31.58,149.60;31.22,149.43;30.86,149.24;30.51,149.03;30.17,148.80;29.85,148.56;" +
+        "29.54,148.29;29.24,148.01;28.96,147.72;28.70,147.41;28.46,147.08;28.23,146.75;28.02,146.40;27.83,146.04;27.67,145.67;27.52,145.29;" +
+        "27.39,144.90;27.28,144.51;27.28,144.08;27.28,143.64;27.28,143.21;27.28,142.77;27.28,142.34;27.27,141.91;27.27,141.47;27.17,140.65;" +
+        "27.04,140.27;26.90,139.89;26.73,139.52;26.55,139.17;26.35,138.82;26.13,138.48;25.89,138.16;25.64,137.85;25.37,137.55;25.08,137.27;" +
+        "24.78,137.00;24.46,136.75;24.14,136.51;23.80,136.30;23.45,136.10;23.09,135.92;22.72,135.76;22.34,135.62;21.96,135.50;21.57,135.40;" +
+        "21.18,135.32;20.78,135.26;20.38,135.22;19.98,135.21;19.58,135.21;19.17,135.24;18.78,135.29;18.38,135.35;17.99,135.44;17.60,135.55;" +
+        "17.22,135.68;16.85,135.83;16.48,136.00;16.13,136.19;15.78,136.40;15.45,136.62;15.13,136.86;14.82,137.12;14.53,137.40;14.25,137.69;" +
+        "13.99,137.99;13.74,138.31;13.51,138.64;13.30,138.98;13.10,139.33;12.93,139.70;12.77,140.07;12.64,140.45;12.52,140.83;12.43,141.22;" +
+        "12.36,141.62;12.30,142.01;12.27,142.42;12.26,142.82;12.28,143.23;12.31,143.65;12.33,144.07;12.36,144.48;12.38,144.90;12.40,145.32;" +
+        "12.43,145.73;12.45,146.15;12.48,146.57;12.50,146.98;12.53,147.40;12.55,147.82;12.55,148.22;12.55,148.62;12.55,149.02;12.55,149.42;" +
+        "12.55,149.82;12.55,150.22;12.55,150.62;12.55,150.80";
+
+    /// <summary>
+    /// 曲线行驶：起点(41.7,111)朝北 → 东入口臂 → 左半圆（第一弯）→ 右半圆（第二弯）→ 西出口臂至 End 前。
+    /// 路径 = 中心线 + 教学要点「左转靠右、右转靠左」的贴外偏移（outerBias）：
+    /// 贴外走转弯半径大、好修方向，并把后轮内切（内轮差约 0.5m）的余量留在弯道内侧。
+    /// 字幕按教练标准打法：左角碰右线左打一圈又1/4 → 中段回正 → 右角碰左线右打一圈又1/4 → 出弯回正。
+    /// </summary>
     private void BuildQxxsPath()
     {
-        _wps = new Vector3[]
+        QxxsTune t = appliedQxxsTune;
+        float outerBias = t != null ? t.outerBias : 0f;     // 额外贴外偏移（米）：0.4m 已烘焙进解析路径，此参数仅作对照实验用
+        float vApproach = t != null ? t.vApproach : 6f;     // 入口直道目标车速（全程恒速 6：与直角转弯统一）
+        float vCurve    = t != null ? t.vCurve : 6f;        // 弯中目标车速
+        float vExit     = t != null ? t.vExit : 6f;         // 出口直道目标车速
+
+        // 1) 解析中心线
+        string[] pairs = QxxsCenterline.Split(';');
+        int n = pairs.Length;
+        Vector3[] basePts = new Vector3[n];
+        for (int i = 0; i < n; i++)
         {
-            new Vector3(41.7f, 0f, 111.0f),
-            new Vector3(41.5f, 0f, 116.5f),
-            new Vector3(39.5f, 0f, 122.5f),
-            new Vector3(36.0f, 0f, 127.5f),
-            new Vector3(31.5f, 0f, 132.0f),
-            new Vector3(26.8f, 0f, 135.8f),
-            new Vector3(22.8f, 0f, 139.0f),
-            new Vector3(19.8f, 0f, 141.8f),
-            new Vector3(17.8f, 0f, 144.0f),
-            new Vector3(16.4f, 0f, 145.6f),
-            new Vector3(15.8f, 0f, 146.8f)
-        };
-        _speeds = new float[] { 9, 9, 8, 7, 7, 7, 7, 7, 7, 7, 8 };
-        _rev = new bool[] { false, false, false, false, false, false, false, false, false, false, false };
-        _hold = new float[] { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-        _handbrake = new bool[_wps.Length];
+            string[] xz = pairs[i].Split(',');
+            basePts[i] = new Vector3(float.Parse(xz[0]), 0f, float.Parse(xz[1]));
+        }
+
+        // 2) 逐点转向量（叉积>0=左转），±3 点平滑后限幅映射为贴外偏移量。
+        //    直线段转向量≈0 自动不偏移；半圆段饱和到 outerBias。
+        float[] crossArr = new float[n];
+        for (int i = 1; i < n - 1; i++)
+        {
+            float ax = basePts[i].x - basePts[i - 1].x, az = basePts[i].z - basePts[i - 1].z;
+            float bx = basePts[i + 1].x - basePts[i].x, bz = basePts[i + 1].z - basePts[i].z;
+            crossArr[i] = ax * bz - az * bx; // >0 = 左转
+        }
+        float[] smooth = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            float sum = 0f; int cnt = 0;
+            for (int j = Mathf.Max(1, i - 3); j <= Mathf.Min(n - 2, i + 3); j++) { sum += crossArr[j]; cnt++; }
+            smooth[i] = cnt > 0 ? sum / cnt : 0f;
+        }
+        _wps = new Vector3[n];
+        float[] amountArr = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            amountArr[i] = outerBias * Mathf.Clamp(smooth[i] * 8f, -1f, 1f);
+        }
+        // 2.2) 偏移限斜率：两弯交接处偏移方向翻转（+0.4 → -0.4），瞬间翻转会在路径上留下
+        //      0.8m 横向台阶 → 样条成 S 甩尾、交接处前馈虚高（0.74 > 弯中稳态 0.50）、
+        //      方向盘在第二弯入口先错打左舵。限制相邻点偏移增量 ≤0.1m（1.2m 步长 →
+        //      最大横向坡度 0.083/m），交接处约 10m 平滑过渡，弯道内偏移饱和段不受影响。
+        for (int i = 1; i < n; i++)
+            amountArr[i] = Mathf.Clamp(amountArr[i], amountArr[i - 1] - 0.1f, amountArr[i - 1] + 0.1f);
+        for (int i = 0; i < n; i++)
+        {
+            int a = Mathf.Max(0, i - 1), b = Mathf.Min(n - 1, i + 1);
+            float tx = basePts[b].x - basePts[a].x, tz = basePts[b].z - basePts[a].z;
+            float len = Mathf.Max(Mathf.Sqrt(tx * tx + tz * tz), 0.001f);
+            // 行进方向右侧法线 = (tz,-tx)/|t|（朝北行驶时指东）；左转弯取正偏移=向右=贴外
+            _wps[i] = new Vector3(basePts[i].x + tz / len * amountArr[i], 0f, basePts[i].z - tx / len * amountArr[i]);
+        }
+
+        // 2.5) Catmull-Rom 样条重采样到 0.4m：把折线拐点圆滑成连续曲线。
+        //      折线（1.2m 步长）的前瞻点跨段跳变是方向盘抖动的源头，样条化从根上消除
+        _wps = ResampleCatmullRom(_wps, 0.4f);
+
+        // 3) 相位锚点（与生成脚本同一几何判据），用于分段车速和教学字幕
+        int curveStart = 0, topMid = 0, diagMid = 0, secondBend = 0, exitArm = n - 1;
+        for (int i = 0; i < n; i++)
+        {
+            float x = _wps[i].x, z = _wps[i].z;
+            if (curveStart == 0 && z >= 144f && x > 38f) curveStart = i;   // 东臂顶：第一弯（左）开始
+            if (topMid == 0 && x <= 34.5f && z >= 148f) topMid = i;        // 顶部：沿外线走
+            if (diagMid == 0 && x <= 26.5f && z <= 143.5f) diagMid = i;    // 中段：回正换向
+            if (secondBend == 0 && x <= 19.5f && z <= 137f) secondBend = i;// 第二弯（右）开始
+            if (exitArm == n - 1 && x <= 14.5f && z >= 141f) exitArm = i;  // 西臂：出弯回正
+        }
+
+        // 4) 分段车速 / 全程 D 档 / 无停车点（数组长度用重采样后的点数，n 是中心线原始点数）
+        int m = _wps.Length;
+        _speeds = new float[m];
+        for (int i = 0; i < m; i++)
+            _speeds[i] = i < curveStart ? vApproach : (i < exitArm ? vCurve : vExit);
+        _rev = new bool[m];
+        _hold = new float[m];
+        _handbrake = new bool[m];
         _steps = new DemoStep[]
         {
-            new DemoStep { atWp = 0, text = "① 车头对准弯道入口、略靠右侧边线，挂 D 档缓慢进入" },
-            new DemoStep { atWp = 1, text = "② 当车头左角即将碰到右侧边线时，向左打一圈又四分之一方向" },
-            new DemoStep { atWp = 3, text = "③ 保持车头左角始终沿右侧边线行驶，有偏差时小角度微调" },
-            new DemoStep { atWp = 5, text = "④ 弯道中段：车头右角即将碰到左侧边线时，先回正方向，再向右打一圈又四分之一" },
-            new DemoStep { atWp = 7, text = "⑤ 保持车头右角沿左侧边线行驶，随时微调方向" },
-            new DemoStep { atWp = 9, text = "⑥ 车头出弯后，从后视镜观察左后轮与边线平行，回正方向驶出" }
+            new DemoStep { atWp = 0, text = "① 车头对准弯道入口，略靠右侧边线低速进入——第一弯向左，记住左转靠右" },
+            new DemoStep { atWp = curveStart, text = "② 车头左角即将碰到右边线：向左打一圈又四分之一方向" },
+            new DemoStep { atWp = topMid, text = "③ 保持车头左角沿着右边线走，有偏差小角度微调，弯中不许停车" },
+            new DemoStep { atWp = diagMid, text = "④ 车头左角即将碰到左边线先回正；右角即将碰到左边线时向右打一圈又四分之一" },
+            new DemoStep { atWp = secondBend, text = "⑤ 保持车头右角沿左边线行驶（右转靠左），看后视镜留意右后轮别压线" },
+            new DemoStep { atWp = exitArm, text = "⑥ 车头出弯，左后轮与边线平行时回正方向，缓慢驶出弯道" }
         };
     }
 
@@ -974,6 +1275,21 @@ public class DemoDriver : MonoBehaviour
     public void StartTuningRound(ZjzwTune tune, string caption)
     {
         appliedTune = tune;
+        ApplyTune(tune);
+        BeginTuningRound(caption);
+    }
+
+    /// <summary>开始一轮曲线行驶调参：注入候选参数并立即从标准起点开始自动演示（QxxsTuner 调用）</summary>
+    public void StartQxxsTuningRound(QxxsTune tune, string caption)
+    {
+        appliedQxxsTune = tune;
+        ApplyQxxsTune(tune);
+        BeginTuningRound(caption);
+    }
+
+    /// <summary>调参轮公共启动流程（参数注入完成后调用）</summary>
+    private void BeginTuningRound(string caption)
+    {
         tuningMode = true;
         roundFinished = false;
         lastResult = null;
@@ -982,7 +1298,6 @@ public class DemoDriver : MonoBehaviour
         _sampleTimer = 0f;
         _roundStartScore = Car_Information.GetScore();
         _roundStartTime = Time.time;
-        ApplyTune(tune);
         ShowCaption(caption, 0f);
         StartDemo();
         if (_state != DemoState.Driving)
@@ -990,6 +1305,17 @@ public class DemoDriver : MonoBehaviour
             // 起点对象找不到等异常：直接按失败记录
             EndTuningRound("no-start");
         }
+    }
+
+    /// <summary>曲线行驶调参参数应用（常规纯跟踪参数；路径几何在 BuildQxxsPath 里读取 appliedQxxsTune）</summary>
+    private void ApplyQxxsTune(QxxsTune t)
+    {
+        if (t == null) return;
+        _arriveDist = t.arriveDist;
+        _lookForward = t.lookForward;
+        _steerGain = t.steerGain;
+        _steerSpeedFwd = t.steerSpeedFwd;
+        _throttleMax = t.throttleMax;
     }
 
     /// <summary>把候选参数应用到路径跟踪字段（BuildZjzwPath 在 StartDemo 里读取 appliedTune）</summary>

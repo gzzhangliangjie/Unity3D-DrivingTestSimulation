@@ -163,7 +163,7 @@ namespace Replay
             isPlaying = false;
             _replayCanvas.GetComponent<CanvasGroup>().alpha = 1;
             _slide.maxValue = _endTime - _startTime;
-            OnReplayTimeChange(0);
+            if (OnReplayTimeChange != null) OnReplayTimeChange(0);
             RefreshTimer();
 
             if (OnReplayStart != null)
@@ -179,11 +179,11 @@ namespace Replay
         // Update is called once per frame
         void Update()
         {
-            if (isPlaying)
+            if (isPlaying && _slide != null)
             {
                 _slide.value += Time.deltaTime * Time.timeScale;
 
-                OnReplayTimeChange(_slide.value);
+                if (OnReplayTimeChange != null) OnReplayTimeChange(_slide.value);
             }
             // You can remove/modify this if you use Space for something else
             if (Input.GetKeyDown(KeyCode.Space))

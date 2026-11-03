@@ -76,6 +76,8 @@ public class ZjzwTuner : MonoBehaviour
         // 自动模式开关 = 项目根/Tuning/zjzw_autostart.flag 文件存在（外部脚本控制）
         try { _autoMode = File.Exists(Path.Combine(TuningDir, "zjzw_autostart.flag")); }
         catch { _autoMode = false; }
+        // 用完即删：残留的 flag 会在之后任何一次 Play 里重新劫持进跑批
+        if (_autoMode) { try { File.Delete(Path.Combine(TuningDir, "zjzw_autostart.flag")); } catch { } }
         if (_autoMode) Debug.Log("[ZjzwTuner] 自动模式已启用（检测到 autostart.flag）");
     }
 
@@ -108,6 +110,10 @@ public class ZjzwTuner : MonoBehaviour
 
         if (Input.GetKeyDown(KeyCode.T))
         {
+            // 只在直角转弯场景响应 T：其他项目场景把 T 让给对应项目的调参器（如 QxxsTuner）
+            SelectPass spNow = FindObjectOfType<SelectPass>();
+            if (spNow != null && spNow.sites != SelectPass.Sites.Zjzw) return;
+
             if (_state == BatchState.Idle) StartBatch();
             else AbortBatch("已中止调参批次（已完成 " + _doneRounds + " 轮）");
             return;

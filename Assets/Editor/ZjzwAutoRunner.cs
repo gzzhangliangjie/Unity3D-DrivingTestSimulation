@@ -4,15 +4,16 @@ using UnityEditor;
 using UnityEngine;
 
 /// <summary>
-/// 【直角转弯调参·编辑器侧自动运行器】供外部脚本/Agent 无人值守跑调参批次。
+/// 【调参批次·编辑器侧自动运行器】供外部脚本/Agent 无人值守跑调参批次。
 ///
-/// 用法（命令行启动 Unity 时带 -autoZjzw 参数）：
-///   Unity.exe -projectPath &lt;工程&gt; -logFile &lt;日志&gt; -autoZjzw
+/// 用法（命令行启动 Unity 时带 -autoZjzw 或 -autoQxxs 参数）：
+///   Unity.exe -projectPath &lt;工程&gt; -logFile &lt;日志&gt; -autoZjzw   （直角转弯）
+///   Unity.exe -projectPath &lt;工程&gt; -logFile &lt;日志&gt; -autoQxxs   （曲线行驶）
 /// 流程：
 ///   1. 工程打开后自动进入 Play 模式（无论当前打开的是哪个场景）；
-///   2. 运行时 ZjzwTuner 检测到 Tuning/zjzw_autostart.flag → 自动补
-///      SelectPass(sites=Zjzw) → 加载 Exam Mode → 连续跑完调参批次；
-///   3. 批次完成/中止时 ZjzwTuner 写 Tuning/zjzw_autostart.done；
+///   2. 运行时对应 Tuner 检测到 Tuning/&lt;项目&gt;_autostart.flag → 自动补 SelectPass
+///      （sites=Zjzw/Qxxs）→ 加载 Exam Mode → 连续跑完调参批次；
+///   3. 批次完成/中止时 Tuner 写 Tuning/&lt;项目&gt;_autostart.done；
 ///   4. 本运行器看到 done → 停止 Play → 退出 Unity（exitCode=0）。
 /// 退出码：0=批次正常完成；2=Play 在完成前被停止；3=超时兜底；5=无法进入 Play。
 /// </summary>
@@ -20,6 +21,7 @@ using UnityEngine;
 public static class ZjzwAutoRunner
 {
     private static readonly bool _auto;
+    private static readonly string _prefix;     // "zjzw" / "qxxs"（决定 autostart/done 文件名）
     private static readonly string _tuningDir;
     private static readonly double _loadTime;   // 工程打开时刻（进入 Play 超时判定用）
     private static double _playStart;           // 进入 Play 时刻（批次超时判定用）
@@ -30,7 +32,8 @@ public static class ZjzwAutoRunner
         string[] args = Environment.GetCommandLineArgs();
         for (int i = 0; i < args.Length; i++)
         {
-            if (args[i] == "-autoZjzw") { _auto = true; break; }
+            if (args[i] == "-autoZjzw") { _auto = true; _prefix = "zjzw"; break; }
+            if (args[i] == "-autoQxxs") { _auto = true; _prefix = "qxxs"; break; }
         }
         if (!_auto) return;
 
@@ -40,7 +43,7 @@ public static class ZjzwAutoRunner
         // 清掉上次的完成标记：本次运行以新写的 done 为准
         try { if (File.Exists(DonePath)) File.Delete(DonePath); } catch { }
 
-        Debug.Log("[ZjzwAutoRunner] 检测到 -autoZjzw：稍后自动进入 Play 模式");
+        Debug.Log("[ZjzwAutoRunner] 检测到 -auto" + _prefix.ToUpperInvariant() + "：稍后自动进入 Play 模式");
         EditorApplication.delayCall += EnterPlay;
         EditorApplication.playModeStateChanged += OnPlayModeChanged;
         EditorApplication.update += Update;
@@ -48,7 +51,7 @@ public static class ZjzwAutoRunner
 
     private static string DonePath
     {
-        get { return Path.Combine(_tuningDir, "zjzw_autostart.done"); }
+        get { return Path.Combine(_tuningDir, _prefix + "_autostart.done"); }
     }
 
     private static void EnterPlay()
@@ -92,7 +95,7 @@ public static class ZjzwAutoRunner
                 EditorApplication.isPlaying = false;
                 return;
             }
-            // 批次超时兜底（默认 12 组 × ~30s，留足余量到 40 分钟）
+            // 批次超时兜底（留足余量到 40 分钟）
             if (EditorApplication.timeSinceStartup - _playStart > 40 * 60)
             {
                 Debug.LogError("[ZjzwAutoRunner] 批次超时兜底，强制退出（exitCode=3）");

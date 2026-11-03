@@ -109,6 +109,29 @@ Assets/
 `StopOffDetector` / `WheelStateDetector`）。需要打 Tag（`TagConst.cs` 里定义了名字）并在编辑器里订阅事件。
 当前最优价值的一件事：**用 `SidelineDetector` 补上曲线行驶缺失的压线检测**（原项目此处是空白，见 README 的"未完善"）。
 
+### 4.5 编辑器内自动模拟指定项目（ExamSimRunner，首选方式）
+`Assets/Editor/ExamSimRunner.cs` 把「中断当前流程 → 重新 Play → 模拟指定项目 → 自动开演示」固化成一次调用。
+**需要重新模拟时一律用它，不要手动停 Play / 手动重开，也不要走游戏内 R 键或结算面板重开**（见第 5 节"不合格结算死锁"）。
+
+触发方式（三选一，等价，任何 Play 状态下都可靠）：
+- 菜单 `Tools/科目二模拟/模拟：倒车入库|侧方停车|半坡起步|直角转弯|曲线行驶|全图考试`；
+  不合格死锁脱困用 `Tools/科目二模拟/重跑上次项目`；
+- Agent/外部脚本：写 `Tuning/examsim_run.flag`，内容为项目名（`dcrk`/`cftc`/`bpqb`/`zjzw`/`qxxs`/`default`
+  或中文"倒车入库"等，写完会被自动删除）；
+- 代码：`ExamSimRunner.Run("Zjzw")`。
+
+流程与保证：
+1. 收到请求 → 清理残留触发 flag（`*_autostart.flag`/`*_editorplay.flag`/`*_rebuild.flag`，防旧调参批次劫持）；
+2. Play 中 → 自动停 Play → 等域重载/编辑器空闲 → 重新进 Play（状态存 `SessionState`，跨域重载不丢）；
+3. 注入/复用 `SelectPass(sites=项目)` → 加载 Exam Mode（让 `MyGameManager.Start` 重跑摆位）→
+   等 `DemoDriver` 自装 → 自动开演示 → 写 `Tuning/examsim_run.done`（`ok:` / `fail:` 开头，供无人值守轮询）；
+4. 总超时 120 秒兜底：卡住只报错并复位，绝不吊死编辑器。
+
+注意：
+- **单项模拟与调参批次不要同时触发**：想跑调参批次用 `Tuning/tune_*.py`（autostart 流程），不要写 `examsim_run.flag`；
+  反过来本运行器会在请求时清掉调参 flag，保证演示不被批次劫持。
+- 编译需在 Unity 中确认 Console 无报错（见第 1 节）；本脚本无任何场景/预制体接线步骤（3.2 不涉及）。
+
 ---
 
 ## 5. 已知坑（前人的经验，别重踩）
@@ -119,6 +142,7 @@ Assets/
 | 手刹要走 `ChangeState()` | `Car_HandleBrake.ChangeState()` 同时翻转 `Activate` + 同步 UI 图标 + 音效；**直接改 `Activate` 会导致图标和实际状态不一致** |
 | 换档动画吞输入 | `GearsDangWei_Control` 用 `Sleep` 延时 + `flag` 防重复，连按档位键时会被动画吞掉；已修为"以最后一次为准"，改这块要回归测试连按 1~4 |
 | 暂停时不能加载场景 | `AsyncLoadScene` 强制 `Time.timeScale = 1`。`MyGameManager.GamePause()` 把 timeScale 设 0，**切场景前必须先 `GameContinue()`**，否则进度条卡死 |
+| 不合格结算死锁 | 判不合格后 `GamePause()` 置 timeScale=0、`GamePlayingFlag=false`、GUI 被 Destroy——游戏内 R 键/重开走 `GameContinue()` 会被 `GamePlayingFlag` 拦住，恢复不了 timeScale。**游戏内重开不可靠，脱困一律用 ExamSimRunner 强制重进 Play**（见 4.5；场景重载会经 `Car_Information.Start()` 把静态分数复位为 100，即 100% 干净复位） |
 | 回放时的错位 | `ReplayEntity` 记录子物体要用 `localPosition`，全记世界坐标回放会错位；回放时应停掉被回放物体上所有控制 Transform 的脚本 |
 | 触摸"闪移" | `TPD.cs` / `FPD.cs` 里的 `camera_panel` 标签面板需限制只接收首次触点，且锚点要与面板四角重合 |
 | 方向盘轴心偏移 | 部分机型方向盘转动轴心偏离——已修，改 UI 方向盘时注意锚点设在盘心 |
