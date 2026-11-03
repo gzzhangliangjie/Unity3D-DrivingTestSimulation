@@ -89,7 +89,13 @@ public class DrivingKernel : MonoBehaviour
         }
         else
         {
-            _steerInput = steeringWheelUi.wheelAngle / (steeringWheelUi.maximumSteeringAngle);
+            //UI 方向盘引用可能失效（加载初期面板未激活、或运行中被销毁的模板实例），
+            //懒补找并做空保护，避免空引用把整个 Update 在转向之前打断
+            if (steeringWheelUi == null)
+                steeringWheelUi = FindObjectOfType<SteeringWheel2D>();
+            _steerInput = steeringWheelUi != null
+                ? steeringWheelUi.wheelAngle / steeringWheelUi.maximumSteeringAngle
+                : 0f;
         }
 
         // ---------- 阿克曼转向角计算 ----------
@@ -158,8 +164,12 @@ public class DrivingKernel : MonoBehaviour
     /// </summary>
     private void ApplyAnalogThrottle()
     {
+        //档位组件可能加载初期找不到（UI 未激活）或运行中被销毁，懒补找 + 空保护
+        if (Gears == null)
+            Gears = FindObjectOfType<GearsDangWei_Control>();
+
         float torque = 0f;
-        if (_analogThrottle > 0.001f)
+        if (Gears != null && _analogThrottle > 0.001f)
         {
             switch (Gears.gears)
             {
@@ -181,16 +191,20 @@ public class DrivingKernel : MonoBehaviour
     /// </summary>
     private void ApplyBrakeForces()
     {
+        //手刹组件同样懒补找 + 空保护（为 null 时按未拉手刹处理，不能让异常打断转向）
+        if (Handle == null)
+            Handle = FindObjectOfType<Car_HandleBrake>();
+
         float brakeNorm = Mathf.Max(_uiBrakeActive ? 1f : 0f, _analogBrake);
         float brakeFront = brakeNorm * brakeTorque;
-        float brakeRear = Mathf.Max(brakeFront, Handle.Activate ? brakeTorque : 0f);
+        float brakeRear = Mathf.Max(brakeFront, (Handle != null && Handle.Activate) ? brakeTorque : 0f);
 
         flWheelCollider.brakeTorque = brakeFront;
         frWheelCollider.brakeTorque = brakeFront;
         rlWheelCollider.brakeTorque = brakeRear;
         rrWheelCollider.brakeTorque = brakeRear;
 
-        Handle_Flag = Handle.Activate;
+        Handle_Flag = Handle != null && Handle.Activate;
     }
 
     /*
@@ -290,6 +304,12 @@ public class DrivingKernel : MonoBehaviour
     /// <param name="press">踏板踩下标记</param>
     public void MobileTerminal_AcceleratorPedal(bool press)
     {
+        //档位组件空保护：找不到时无法判断档位，安全退出（与模拟量路径同一懒补找逻辑）
+        if (Gears == null)
+            Gears = FindObjectOfType<GearsDangWei_Control>();
+        if (Gears == null)
+            return;
+
         if(press)
         {
             switch (Gears.gears)

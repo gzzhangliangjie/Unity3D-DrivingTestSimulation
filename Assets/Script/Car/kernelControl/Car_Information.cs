@@ -35,6 +35,8 @@ public class Car_Information : MonoBehaviour
     public static void DeductScore(int dscore)
     {
         Score -= dscore;
+        // 扣分是低频事件，打调用栈方便定位扣分来源（哪个检测器/哪堵墙）
+        Debug.Log("[Score] 扣 " + dscore + " 分，剩余 " + Score + "，来自：\n" + StackTraceUtility.ExtractStackTrace());
     }
 
     public static int GetScore()

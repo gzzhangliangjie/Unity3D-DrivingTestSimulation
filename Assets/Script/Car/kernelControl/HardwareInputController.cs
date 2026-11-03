@@ -1,4 +1,5 @@
 ﻿using UnityEngine;
+using UnityEngine.SceneManagement;
 
 /// <summary>
 /// 【外接方向盘/踏板输入控制器】
@@ -76,6 +77,54 @@ public class HardwareInputController : MonoBehaviour
     private Car_HandleBrake _handleBrake; // 手刹组件（UI 图标 + 音效都在它身上）
     private GearsDangWei_Control _gears;  // 档位控制
     private TurnLight _turnLight;         // 转向灯
+
+    // ============================================================
+    //  自动安装：进入有车的场景（考试模式/自由模式等）时自动挂到车辆上，
+    //  与 DemoDriver 的 RuntimeInitializeOnLoadMethod 方案一致，零场景改动。
+    //  若编辑器里已手工挂过，则不会重复添加。
+    // ============================================================
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
+    private static void InstallOnSceneLoad()
+    {
+        SceneManager.sceneLoaded += OnSceneLoaded;
+
+        // 安装看门狗：Play 中域重载（重编译）会丢失静态事件订阅，
+        // 用一个常驻对象每 0.5 秒自检兜底（与 DemoDriverInstaller 同一机制）
+        if (FindObjectOfType<HardwareInputInstaller>() == null)
+        {
+            GameObject go = new GameObject("HardwareInputInstaller");
+            DontDestroyOnLoad(go);
+            go.AddComponent<HardwareInputInstaller>();
+        }
+
+        TryInstall(SceneManager.GetActiveScene());
+    }
+
+    private static void OnSceneLoaded(Scene scene, LoadSceneMode mode)
+    {
+        TryInstall(scene);
+    }
+
+    /// <summary>确保当前活动场景的车辆上装有 HardwareInputController，可重复调用（看门狗入口）</summary>
+    public static void EnsureInstalled()
+    {
+        TryInstall(SceneManager.GetActiveScene());
+    }
+
+    private static void TryInstall(Scene scene)
+    {
+        //已有实例（编辑器手工挂的）就不重复加
+        if (FindObjectsOfType<HardwareInputController>().Length > 0)
+            return;
+
+        //无 DrivingKernel 的场景（主菜单/Loading）不装
+        DrivingKernel kernel = FindObjectOfType<DrivingKernel>();
+        if (kernel == null)
+            return;
+
+        kernel.gameObject.AddComponent<HardwareInputController>();
+        Debug.Log("[HardwareInputController] 场景中未挂载，已自动安装到车辆 " + kernel.gameObject.name + "（场景：" + scene.name + "）");
+    }
 
     private void Start()
     {
@@ -245,5 +294,24 @@ public class HardwareInputController : MonoBehaviour
         if (Mathf.Abs(value) < deadZone)
             return 0f;
         return value;
+    }
+}
+
+/// <summary>
+/// HardwareInputController 安装看门狗：常驻场景（DontDestroyOnLoad），每 0.5 秒自检一次。
+/// 覆盖场景：Play 中重编译（域重载丢失静态订阅）、场景事件订阅失效等，
+/// 保证只要当前场景里有车且未挂控制器，就能自动补装。
+/// </summary>
+public class HardwareInputInstaller : MonoBehaviour
+{
+    private float _timer = 0.2f;
+
+    private void Update()
+    {
+        _timer -= Time.deltaTime;
+        if (_timer > 0f) return;
+        _timer = 0.5f;
+
+        HardwareInputController.EnsureInstalled();
     }
 }
