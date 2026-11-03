@@ -31,6 +31,9 @@
 Thumbs.db
 desktop.ini
 
+# WorkBuddy 工程数据（记忆/会话数据，不入库）
+.workbuddy/
+
 # 构建产物
 *.apk
 *.aab
