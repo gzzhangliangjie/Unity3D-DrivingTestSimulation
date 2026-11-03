@@ -196,6 +196,11 @@ public class DemoDriver : MonoBehaviour
             rb.rotation = spawnObj.transform.rotation;
             rb.WakeUp();
         }
+        Debug.Log(string.Format("[DEMO] 开始 sites={0} 起点=({1:F1},{2:F1},{3:F1}) 起点yaw={4:F0} rb位置=({5:F1},{6:F1},{7:F1}) rb子物={8}",
+            _sites, spawnObj.transform.position.x, spawnObj.transform.position.y, spawnObj.transform.position.z,
+            spawnObj.transform.eulerAngles.y,
+            rb != null ? rb.position.x : -1f, rb != null ? rb.position.z : -1f, 0f,
+            rb != null ? rb.name : "null"));
 
         // 2) 挂 D 档、松手刹
         if (_gears != null) _gears.D();
@@ -369,6 +374,16 @@ public class DemoDriver : MonoBehaviour
         else
         {
             _stuckTimer = 0f;
+        }
+
+        // 6) 调试遥测（每 0.5s 一条，调完删）
+        _logTimer -= Time.deltaTime;
+        if (_logTimer <= 0f)
+        {
+            _logTimer = 0.5f;
+            Debug.Log(string.Format("[DEMO] pos=({0:F1},{1:F1}) yaw={2:F0} wp={3}/{4} steer={5:F2} v={6:F1} gearRev={7} distWp={8:F1} throttle={9:F2}",
+                pos.x, pos.z, transform.eulerAngles.y, _wpIndex, _wps.Length - 1,
+                _steer, v, _gearReverse, FlatDist(pos, _wps[_wpIndex]), throttle));
         }
     }
 
