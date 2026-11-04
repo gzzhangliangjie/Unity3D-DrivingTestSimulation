@@ -48,6 +48,7 @@ desktop.ini
 !/Tuning/focus_unity.py
 !/Tuning/probe_walls_static.py
 !/Tuning/zjzw_scene_dump.txt
+!/Tuning/驾驶参数规范.md
 
 # 构建产物
 *.apk

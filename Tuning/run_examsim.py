@@ -25,8 +25,17 @@ FLAG = os.path.join(TUNING_DIR, "examsim_run.flag")
 DONE = os.path.join(TUNING_DIR, "examsim_run.done")
 
 CONSUME_TIMEOUT = 90     # 等 flag 被消费（含重编译/域重载）上限
-DONE_TIMEOUT = 240       # 等单个项目演示跑完/结算上限
+DONE_TIMEOUT = 240       # 等单个项目演示跑完/结算上限（全科 Default 见 done_timeout()）
+DONE_TIMEOUT_DEFAULT = 900  # 全科连续路线约 6~8 分钟，240s 必超时 → 放宽
 GAP_BETWEEN = 4          # 项目之间留点缓冲，避免抢在停 Play 中途
+
+
+def done_timeout(site):
+    """全科（Default/全图考试）连续路线远长于单科，等待上限单独放宽。"""
+    u = (site or "").strip().lower()
+    if u in ("default", "全图考试", "全图", "考试"):
+        return DONE_TIMEOUT_DEFAULT
+    return DONE_TIMEOUT
 
 TERMINAL_OK = "自动停 Play"
 TERMINAL_FAIL_PREFIX = "fail:"
@@ -89,7 +98,7 @@ def run_one(site):
         log(f"[!] {site}: {CONSUME_TIMEOUT}s 内 flag 未被消费——Unity 可能未在编辑态/编译卡死，终止本批。")
         return (site, "TIMEOUT_CONSUME", "")
     log(f"{site}: flag 已消费，等待演示跑完/结算…")
-    content = wait_done_terminal(DONE_TIMEOUT)
+    content = wait_done_terminal(done_timeout(site))
     if content is None:
         log(f"[!] {site}: {DONE_TIMEOUT}s 内无终态 done，可能演示未启动或卡死。")
         return (site, "TIMEOUT_DONE", "")

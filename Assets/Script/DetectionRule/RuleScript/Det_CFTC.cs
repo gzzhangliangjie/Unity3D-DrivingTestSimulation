@@ -27,6 +27,13 @@ public class Det_CFTC : MonoBehaviour
     [Header("空气墙")]
     public GameObject AirWall;
 
+    [Header("考试流程（全图考试由 ExamFlow 逐项激活）")]
+    [Tooltip("未激活时：不计时、不判中途停车、不做入库判定。单科练习恒为 true")]
+    public bool armed = true;
+    /// <summary>本项目已判定完成（库内停稳到位），供 ExamFlow 推进下一项目。</summary>
+    public bool IsCompleted { get; private set; }
+    private float _timerMax = 90f;
+
     private Transform targetPlayer;
 
     private void Start()
@@ -34,6 +41,18 @@ public class Det_CFTC : MonoBehaviour
         targetPlayer = GameObject.FindGameObjectWithTag("Player").transform;
         detIsStop = true;
         _isStop = true;
+    }
+
+    /// <summary>由 ExamFlow 切换：切入本项时重置倒计时与中途停车状态，保证每项独立限时。</summary>
+    public void SetArmed(bool value)
+    {
+        if (armed == value) return;
+        armed = value;
+        if (!value) return;
+        timer = _timerMax;
+        mpTime = 0f;
+        _isStop = true;
+        detIsStop = true;
     }
 
     enum Step
@@ -44,6 +63,7 @@ public class Det_CFTC : MonoBehaviour
 
     private void Update()
     {
+        if (!armed) return;
         if (Car_Information.Speed == 0)
         {
             mpTime += Time.deltaTime;
@@ -91,6 +111,7 @@ public class Det_CFTC : MonoBehaviour
                     detIsStop = false;
                     targetPlayer.GetComponent<VoicePromptAudio>().Play_TingCheYiDaoWei();
                     step = Step.Default;
+                    IsCompleted = true;
                     Destroy(AirWall);
                 }
                 else if (JuLi <= difference_carbarn)//在停车范围内，不能判定为中途停车
@@ -103,7 +124,7 @@ public class Det_CFTC : MonoBehaviour
         }
 
         //中途停车判定（如果车辆是停止的且不在停车范围内）
-        if (_isStop && detIsStop)
+        if (_isStop && detIsStop && !ExamJudge.DrivingDone)
         {
             targetPlayer.GetComponent<VoicePromptAudio>().Play_ZhongTuTingChe();
             Car_Information.DeductScore(5);

@@ -30,11 +30,28 @@ public class Det_DCRK : MonoBehaviour
     [Header("空气墙")]
     public GameObject AirWall;
 
+    [Header("考试流程（全图考试由 ExamFlow 逐项激活）")]
+    [Tooltip("未激活时：不计时、不判中途停车、不做倒库判定。单科练习恒为 true")]
+    public bool armed = true;
+    private float _timerMax = 210f;
+
     private Transform targetPlayer;
 
     private void Start()
     {
         targetPlayer = GameObject.FindGameObjectWithTag("Player").transform;
+    }
+
+    /// <summary>由 ExamFlow 切换：切入本项时重置倒计时与中途停车状态，保证每项独立限时。</summary>
+    public void SetArmed(bool value)
+    {
+        if (armed == value) return;
+        armed = value;
+        if (!value) return;
+        timer = _timerMax;
+        mpTime = 0f;
+        _isStop = false;
+        detIsStop = true;
     }
 
     enum Step
@@ -45,6 +62,7 @@ public class Det_DCRK : MonoBehaviour
 
     private void Update()
     {
+        if (!armed) return;
         //Debug.DrawLine(targetPlayer.position, point_carbarn.position, Color.red);
         //JuLi = Vector3.Distance(targetPlayer.position, point_carbarn.position);
         //判断汽车是否完全停止
@@ -121,7 +139,7 @@ public class Det_DCRK : MonoBehaviour
         }
 
         //中途停车判定（如果车辆是停止的且不在停车范围内）
-        if (_isStop && detIsStop)
+        if (_isStop && detIsStop && !ExamJudge.DrivingDone)
         {
             targetPlayer.GetComponent<VoicePromptAudio>().Play_ZhongTuTingChe();
             Car_Information.DeductScore(5);

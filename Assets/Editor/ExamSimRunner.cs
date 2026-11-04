@@ -44,6 +44,7 @@ public static class ExamSimRunner
     private const string SessionLastKey = "ExamSimRunner.LastSite";   // 上次成功请求的项目（"重跑当前项目"用）
     private const string EnteredKey = "ExamSimRunner.PlayOurs";       // 当前 Play 是本运行器发起的（跨域重载持久）
     private const string WatchKey = "ExamSimRunner.WatchEnd";         // 演示结束监视：结算界面自动停 Play（跨域重载持久）
+    private const string WatchMaxKey = "ExamSimRunner.WatchMax";      // 本轮监视超时秒数（全科连续路线远长于单科，需放宽）
     private const string TriggerFlag = "examsim_run.flag";
     private const string DoneFile = "examsim_run.done";
     private const double OverallTimeout = 120.0;
@@ -131,6 +132,8 @@ public static class ExamSimRunner
         _tsZeroAt = -1;
         SessionState.SetString(SessionKey, site.ToString());
         SessionState.SetFloat(SessionStartKey, (float)EditorApplication.timeSinceStartup);
+        // 监视超时：全科（Default）连续路线约 6~8 分钟，300s 兜底会中途掐断 → 放宽到 900s
+        SessionState.SetFloat(WatchMaxKey, site == SelectPass.Sites.Default ? 900f : 300f);
         _stopSent = false;
         _entered = false;
         _injectStep = 0;
@@ -253,11 +256,7 @@ public static class ExamSimRunner
             case 1:
                 // 等 Exam Mode 场景加载完且组件 Start 跑完
                 if (s.name != "Exam Mode" || _waitFrames < 10) return;
-                if (site == SelectPass.Sites.Default)
-                {
-                    Finish(true, "全图考试已就绪（默认模式不自动演示，请手动驾驶）");
-                    return;
-                }
+                // 全科（Default）现已支持自动演示：与其它科目一致，等 DemoDriver 装好后自动开演示
                 _injectStep = 2;
                 _waitFrames = 0;
                 return;
@@ -324,7 +323,7 @@ public static class ExamSimRunner
     /// 结束判定（任一满足即停 Play）：
     /// 1. DemoDriver 状态退出 Driving（正常跑完 → Finished）持续约 2 秒；
     /// 2. timeScale=0 持续 3 秒（不合格结算冻结：游戏挂起等玩家按键，无人值守即卡死）；
-    /// 3. 监视超时 300 秒兜底。
+    /// 3. 监视超时兜底（单科 300 秒 / 全科 Default 900 秒，Run 时按项目写入 SessionState）。
     /// </summary>
     private static void WatchDemoEnd()
     {
@@ -379,10 +378,10 @@ public static class ExamSimRunner
             }
         }
 
-        if (!ended && now - SessionState.GetFloat(SessionStartKey, 0f) > 300.0)
+        if (!ended && now - SessionState.GetFloat(SessionStartKey, 0f) > SessionState.GetFloat(WatchMaxKey, 300f))
         {
             ended = true;
-            why = "监视超时 300s 兜底";
+            why = "监视超时 " + (int)SessionState.GetFloat(WatchMaxKey, 300f) + "s 兜底";
         }
 
         if (ended)

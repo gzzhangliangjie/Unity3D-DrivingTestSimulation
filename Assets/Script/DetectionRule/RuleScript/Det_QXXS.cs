@@ -13,6 +13,10 @@ public class Det_QXXS : MonoBehaviour
     public bool detIsStop = true;//车辆在运行时停止一次仅扣一次中途停车的分
     public Text textTimer;
 
+    [Header("考试流程（全图考试由 ExamFlow 逐项激活）")]
+    [Tooltip("未激活时：不判中途停车。单科练习恒为 true")]
+    public bool armed = true;
+
     private Transform targetPlayer;
     private void Start()
     {
@@ -20,8 +24,20 @@ public class Det_QXXS : MonoBehaviour
         targetPlayer = GameObject.FindGameObjectWithTag("Player").transform;
     }
 
+    /// <summary>由 ExamFlow 切换：切入本项时重置中途停车状态。</summary>
+    public void SetArmed(bool value)
+    {
+        if (armed == value) return;
+        armed = value;
+        if (!value) return;
+        mpTime = 0f;
+        _isStop = false;
+        detIsStop = true;
+    }
+
     private void Update()
     {
+        if (!armed) return;
         //判断汽车是否完全停止
         if (Car_Information.Speed == 0)
         {
@@ -39,7 +55,7 @@ public class Det_QXXS : MonoBehaviour
             detIsStop = true;//初步：可以判定中途停车检测
         }
         //中途停车判定（如果车辆是停止的且不在停车范围内）
-        if (_isStop && detIsStop)
+        if (_isStop && detIsStop && !ExamJudge.DrivingDone)
         {
             print("曲线行驶中途不得停车");
             targetPlayer.GetComponent<VoicePromptAudio>().Play_ZhongTuTingChe();

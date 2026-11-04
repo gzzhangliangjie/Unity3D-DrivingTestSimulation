@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 using UnityEngine.UI;
@@ -100,6 +100,54 @@ public class DemoDriver : MonoBehaviour
     }
     private DemoStep[] _steps;
 
+    // ---- 全科连续路线专用（Default 模式）----
+    private SelectPass.Sites _activeSite;   // 当前行驶段所属科目（单科时恒等于 _sites；全科时随路点切换）
+    private SelectPass.Sites[] _segSite;    // 每个路点所属科目（仅 Default 使用，用于分段切换科目专属参数）
+    private bool[] _segConn;                // 每个路点是否处于"科间连接段"（连接段只走纯跟踪，禁用各科专属转向/精准停点）
+
+    // ---- 全科分段基址（Default）----
+    // 科目专属动作（倒库满舵点、侧方摆正/出库左打满）在单科路点里是按**段内索引**标定的：
+    // 侧方 wp14~17 摆正、wp18~26 左打满出库；倒库 wp7~16 / 26~35 满舵、wp16~22 / 35~41 直出。
+    // 全科把五科首尾相接后，这些索引带上了前面科目的基址（侧方段起点≈47），
+    // 直接用全局 _wpIndex 判断会让条件全部落空 —— 实测表现为侧方停车出库时左打满不生效，
+    // 车头顶到库位东壁 x=-9.83 压线扣 100。故统一换算成段内相对索引。
+    private static readonly SelectPass.Sites[] _defaultOrder =
+    {
+        SelectPass.Sites.Dcrk, SelectPass.Sites.Cftc, SelectPass.Sites.Zjzw,
+        SelectPass.Sites.Bpqb, SelectPass.Sites.Qxxs
+    };
+    private int[] _segStart;                // 每科段首路点在 _wps 中的全局索引（与 _defaultOrder 同序）
+    private int _curSegStart;               // 当前所在科目段的段首全局索引
+    /// <summary>当前路点在本科目段内的相对索引（单科模式恒等于 _wpIndex）。</summary>
+    private int RelWp { get { return _wpIndex - _curSegStart; } }
+
+    // 全科连接段中间路点（可编辑，仅供校准）。索引（真实考试顺序）：
+    //   [0] 倒车入库→侧方停车  [1] 侧方停车→直角转弯  [2] 直角转弯→半坡起步  [3] 半坡起步→曲线行驶。
+    // 每个元素是该连接段"严格中间"路点（不含两端科目各自的终点/起点）。留 null = 用两端点直线插值（每 ~15m 一个点）。
+    // 已按 ObstacleProbe 场景碰撞体扫描校准：
+    //   [0][1][2] 直连走廊无障碍（锥桶都在走廊北侧边界，最近净空 ≥2m；全科模式下非曲线压线墙自动禁用）；
+    //   [3] 坡顶→曲线入口：按地面归属扫描（Tuning/ground_probe.txt）走"路面"，别压草坪——
+    //       坡顶向北的南北车道只有 x∈[28,36] 是路面（x>37 全是 Grass 瓦片），
+    //       绕开 RoadBlock_D(2)(3)（x 37.40~38.08，z 95.90~101.58）后再向东并入曲线入口 (41.7,111.4)。
+    private static readonly Vector3[][] _defaultConnectors = new Vector3[][]
+    {
+        null,                              // 0 倒库→侧方：直连
+        null,                              // 1 侧方→直角：直连
+        null,                              // 2 直角→半坡：直连（出口路向北即坡道入口）
+        new Vector3[]                      // 3 半坡→曲线：贴车道中线北上，过全部路障后再东并
+        {
+            new Vector3(34.0f, 0f, 52.0f),   // 坡顶下来先回车道中线（路面 x[28,36]）
+            new Vector3(34.0f, 0f, 68.0f),
+            new Vector3(34.0f, 0f, 84.0f),
+            new Vector3(34.3f, 0f, 96.0f),   // 过 RoadBlock_D(3)（x 37.40~38.08，z 95.90~96.72）
+            new Vector3(34.8f, 0f, 103.0f),  // 过 RoadBlock_D(2)（z 100.75~101.58）后再动方向：
+                                             // 实测若提前在 z94 就开始东并，直达 (37,104) 的连线会让
+                                             // 车身右缘在 z101 处离墩子只剩 0.1m（等于擦着过）
+            new Vector3(37.5f, 0f, 107.0f),
+            new Vector3(39.8f, 0f, 109.5f),  // 并入曲线入口 (41.7,111.4)
+        },
+    };
+
     // ---------------- 运行状态 ----------------
     private DemoState _state = DemoState.Idle;
     private DrivePhase _phase = DrivePhase.Run;
@@ -107,10 +155,12 @@ public class DemoDriver : MonoBehaviour
     private float _steerTargetSmooth; // 转向目标低通滤波值（抑制前瞻点跨段跳变导致的方向盘抖动）
     private float _driveTime;         // 本轮演示已行驶时长（起步斜坡用：起步 1s 内限制转向幅度）
     private float _lastFF;            // 最近一帧的曲率前馈舵量（遥测诊断用）
+    private bool _ffSpanFix;          // 前馈曲率按「首末弦中点实际间距」修正（离散路点会低估一半，仅 Dcrk 启用）
     private float _logTimer = 0f;   // 调试遥测计时（调完删）
     private bool _gearReverse;      // 当前档位是否 R（倒车）
     private bool _leftStart;        // 是否已离开起点区域（防止起步当帧跳点）
     private bool _pendingShift;     // 刹停后需要换档
+    private bool _shiftTargetRev;   // 刹停后要挂的档位（真车：停稳→挂档→起步，不等起步再刹一次）
     private bool _pendingFinish;    // 刹停后结束演示
     private float _holdRemaining;   // 当前停车保持剩余秒数
     private float _shiftTimer;      // 换档等待计时
@@ -128,11 +178,37 @@ public class DemoDriver : MonoBehaviour
     private int _stopAtIndex = -1;  // 精准停点目标路点（-1=无）
     private float _stopAtLastD = 999f; // 上一帧距停点距离（不减反增=已越过→强制刹停兜底）
     private float _stopReach = 0.45f;  // 贴近停点的判定距离（米）；Cftc 入库段收窄到 0.25 防倒过头撞后墙
+
+    // ---- 侧方入库「位姿收车」（v29）----
+    // 不再用「距路点多少米」收车：那个量随前瞻/路点疏密漂移 ±0.3m，而 Det_CFTC 的入库窗
+    // Ab = 车心z + 32.806 ≤ 1.65 → 车心z ≤ -31.156，库底又在 ≈-31.7，可用带宽只有 0.5m。
+    // 直接按车心 z 收车，停点与转向参数彻底解耦：以后改前瞻/改路点稀疏都不会把停点带偏。
+    private bool _cftcStopByPose;        // 侧方入库按位姿收车（仅侧方段 + 倒车档生效）
+    private float _cftcStopZ = -31.15f;  // 深度校验：车心 z ≤ 此值才算车身进了库深范围（判定 Ab≤1.65）
+    // 半坡定点：Det_BPQB 的定点窗只有 30cm 宽（车心 z ∈ [40.88,41.18]），
+    // 靠距离触发硬刹的滑行量会漂出窗（实测一轮 40.95 合格、一轮 40.55 判中途停车），故按位姿收车。
+    private bool _bpqbStopByPose;
+    private float _bpqbStopZ = 40.95f;   // 车心 z ≥ 此值即刹停；坡上 3.5km/h 蠕行滑行 ≈0.15m → 停稳 ≈41.1（窗 [40.88,41.18] 内）
+    // 收车点不写死坐标：就是「倒车段最后一个路点」的 x（路线自己写着停在哪），
+    // 沿行驶方向 +0.12m 作为刹车余量。见 CftcStopX()。
+    private float CftcStopX()
+    {
+        int i = Mathf.Clamp(_wpIndex, 0, _wps.Length - 1);
+        while (i + 1 < _rev.Length && _rev[i + 1]) i++;
+        return _wps[i].x + 0.12f;
+    }
     // 倒车专项（仅 _preciseStop 路线生效）：侧方停车倒车段纯跟踪会持续偏转，
     // 10m 内车头从 90° 掉到 45°（车尾下扫 1.5m 撞后墙）。拉长前瞻稳住直线跟踪 +
     // 限制倒车舵量上限防"驶向新路点瞬间"的方向尖峰饱和。
     private float _lookReverseOverride = -1f; // >0 时覆盖 _lookReverse
     private float _revSteerCap = 1f;          // 倒车舵量上限（1=不限制）
+
+    // ---- 倒车入库「直接打满」点位（v27）----
+    // 挂 R 后先沿通道直退，车心到打满点立刻满舵，保持到车身与库位平行再回正。
+    // 点位按下式取：打满点 x = 库中心 x ∓ 满舵实际半径（库中心 = -71.60，实测满舵半径 ≈4.6m）。
+    // 想微调入库左右位置只改这两个数（第一次右倒库在行驶线东侧打满，第二次西侧镜像）。
+    private float _dcrkLockX = -67.4f;   // 第一次（右倒库）打满点：车心 x 小于此值即满舵
+    private float _dcrkLockX2 = -76.3f;  // 第二次（镜像倒库）打满点：车心 x 大于此值即满舵
 
     // ============================================================
     //  调参模式（ZjzwTuner 驱动；参数从项目根 Tuning/zjzw_tuning.json 热注入，
@@ -198,7 +274,7 @@ public class DemoDriver : MonoBehaviour
 
         SelectPass sp = Object.FindObjectOfType<SelectPass>();
         if (sp == null) return;
-        if (sp.sites == SelectPass.Sites.Default) return; // Default 是全图考试，不装
+        // Default（全图考试）也装：提供与其他五科一致的"开启指引"按钮，演示车按真实连续路线把五科串起来开一遍
 
         DrivingKernel kernel = Object.FindObjectOfType<DrivingKernel>();
         if (kernel == null) return;
@@ -307,13 +383,24 @@ public class DemoDriver : MonoBehaviour
 
     private void StartDemo()
     {
+        // 先清上次残留；BuildDcrkWps / BuildCftcPath / SyncSegParams 会按科目设置倒车前瞻。
+        // 这一行必须放在 BuildPath() 之前——放在后面会把倒库专用的短前瞻重置掉，
+        // 车重新按 2.6m 前瞻切内弯（只往西走、不南下，车尾扫库口横墙西端）。
+        _lookReverseOverride = -1f;
+        _revSteerCap = 1f;   // 残留清理（BuildDcrkWps 会按科目覆盖，v23 教训：建路后的重置会冲掉 0.88）
+        _ffSpanFix = false;
+        _cftcStopByPose = false;
+        _bpqbStopByPose = false;
         if (!BuildPath()) return;
+        _activeSite = _sites; // 单科恒等于 _sites；全科由 SyncSegParams 按路点动态切换
 
         // 1) 把车传回项目起点（无论玩家刚才开到哪，演示永远从标准起点开始）
-        GameObject spawnObj = GameObject.Find(_sites.ToString());
+        //    全科连续路线从第一科（倒车入库）起点开始，故 Default 用 "Dcrk" 起点对象
+        string spawnName = (_sites == SelectPass.Sites.Default) ? "Dcrk" : _sites.ToString();
+        GameObject spawnObj = GameObject.Find(spawnName);
         if (spawnObj == null)
         {
-            ShowCaption("演示启动失败：找不到项目起点对象 " + _sites, 5f);
+            ShowCaption("演示启动失败：找不到项目起点对象 " + spawnName, 5f);
             return;
         }
         Rigidbody rb = _kernel.GetComponentInParent<Rigidbody>();
@@ -321,8 +408,13 @@ public class DemoDriver : MonoBehaviour
         {
             rb.velocity = Vector3.zero;
             rb.angularVelocity = Vector3.zero;
-            rb.position = spawnObj.transform.position;
-            rb.rotation = spawnObj.transform.rotation;
+            // 全图考试（Default）不挪车：MyGameManager 在 Default 下保持玩家车原位，
+            // 连续路线的起点就是全图考试自己的入口。单科演示才回各自的标准起点。
+            if (_sites != SelectPass.Sites.Default)
+            {
+                rb.position = spawnObj.transform.position;
+                rb.rotation = spawnObj.transform.rotation;
+            }
             rb.WakeUp();
         }
         Debug.Log(string.Format("[DEMO] 开始 sites={0} 起点=({1:F1},{2:F1},{3:F1}) 起点yaw={4:F0} rb位置=({5:F1},{6:F1},{7:F1}) rb子物={8}",
@@ -369,12 +461,15 @@ public class DemoDriver : MonoBehaviour
         _routeSpeed = -1f;
         _pendingShift = false;
         _pendingFinish = false;
+        ExamJudge.DrivingDone = false;   // 新一轮演示：恢复中途停车判定
         _holdRemaining = 0f;
         _shiftTimer = 0f;
         _stopAtIndex = -1;
         _stopAtLastD = 999f;
-        _lookReverseOverride = -1f;
-        _revSteerCap = 1f;
+        // _lookReverseOverride 不在这里重置：BuildDcrkWps / BuildCftcPath 在 BuildPath()
+        // 里按科目设好了值，重置会让倒车段退回 2.6m 前瞻而切内弯。
+        // _revSteerCap / _ffSpanFix 同理不在这里重置（v23 实测：这行把 Dcrk 的 0.88 钳制
+        // 冲掉，弧中舵量又打到 1.0，车尾甩过头扫库口东翼）。残留清理已移到 StartDemo() 开头。
         _phase = DrivePhase.Run;
         _state = DemoState.Driving;
         _demoUsed = true;
@@ -430,27 +525,151 @@ public class DemoDriver : MonoBehaviour
     /// <summary>进入刹停阶段：记录停稳后要做的事（换档 / 点位保持 / 结束演示）</summary>
     private void BeginStop(bool needShift, float holdSeconds, bool finish)
     {
+        // 终点收车：路线已走完，之后这次停稳不是「中途停车」。
+        // 检测器只看 Speed==0，会在这 1 秒后扣 100（实测直角转弯单科演示跑完被扣 100）。
+        if (finish) ExamJudge.DrivingDone = true;
         _pendingShift = needShift;
         _pendingFinish = finish;
         _holdRemaining = holdSeconds;
+        if (needShift)
+        {
+            // 停稳就挂好档（真车操作顺序）：停点是 hold 路点时，目标档位取「下一段」的档，
+            // 而不是当前段 —— 否则起步那一帧还挂在 R 上，车会先往后溜半米再刹车换 D，
+            // 视觉上就是「出库先回一下」。
+            int i = Mathf.Clamp(_wpIndex, 0, _wps.Length - 1);
+            if (_rev != null && _rev.Length == _wps.Length && _rev[i] == _gearReverse && i + 1 < _wps.Length)
+                i++;
+            if (_rev != null && _rev.Length == _wps.Length) _shiftTargetRev = _rev[i];
+        }
         _phase = DrivePhase.BrakeToStop;
+    }
+
+    /// <summary>全科连续路线：根据当前路点所属科目，动态切换转向/精准停点等"科目专属"参数。
+    /// 单科模式不走这里（参数由各自的 Build*Path 固定设置，_activeSite 恒等于 _sites）。</summary>
+    private void SyncSegParams(int wpIndex)
+    {
+        if (_sites != SelectPass.Sites.Default || _segSite == null) return;
+        int idx = Mathf.Clamp(wpIndex, 0, _segSite.Length - 1);
+        SelectPass.Sites seg = _segSite[idx];
+        _activeSite = seg;
+
+        // 段内相对索引基址：科目专属动作按「本科目第几个路点」判断（见 _defaultOrder 注释）
+        int si = System.Array.IndexOf(_defaultOrder, seg);
+        _curSegStart = (_segStart != null && si >= 0 && si < _segStart.Length) ? _segStart[si] : 0;
+
+        // 连接段：只走纯跟踪，禁用一切科目专属转向与精准停点
+        if (_segConn != null && idx < _segConn.Length && _segConn[idx])
+        {
+            _preciseStop = false;
+            _stopReach = 0.45f;
+            _lookReverseOverride = -1f;
+            _revSteerCap = 1f;
+            _zjzwDynamic = false;
+            _zjzwLockArc = false;
+            _curSegStart = -1000000;   // 让 RelWp 落到所有区间之外，彻底杜绝专属动作误触发
+            return;
+        }
+
+        // 复位默认值，再按科目覆盖
+        _preciseStop = false;
+        _stopReach = 0.45f;
+        _lookReverseOverride = -1f;
+        _revSteerCap = 1f;
+        _ffSpanFix = false;
+        _zjzwDynamic = false;
+        _zjzwLockArc = true;
+        _cftcStopByPose = false;
+        _bpqbStopByPose = false;
+        if (seg == SelectPass.Sites.Dcrk)
+        {
+            // 全图第一科要按 Det_DCRK 正常判定链停稳四次：point_right(2m 窗) → 库内 Ab<=3.2
+            // → point_left(2m 窗) → 库内 Ab<=3.2，ParkingCount 到 2 才销毁出口空气墙。
+            // 普通到达距离 2.2m 会让车停在判定窗外，故收窄触发距离；库内停点路点取 z=-41.0，
+            // 即使纯跟踪一路倒到路点，车尾 z=-43.25 仍在库底 -43.305 之内、Ab 也仍在 3.2 内。
+            _preciseStop = true;
+            _stopReach = 0.7f;
+            // 与单科 BuildDcrkWps 一致：密集圆弧下 2.6m 前瞻会切内弯，车只往西走不南下。
+            _lookReverseOverride = 3.5f;
+        }
+        else if (seg == SelectPass.Sites.Cftc)
+        {
+            _preciseStop = true;
+            _stopReach = 0.45f;   // 与单科一致：兜底距离，真正收车靠位姿阈值
+            // 与单科一致：侧方倒车用默认 2.6m 前瞻（3.5 会让弧提前起弯、停不到位）
+            _lookReverseOverride = -1f;
+            _revSteerCap = 1.0f;
+            _cftcStopByPose = true;
+        }
+        else if (seg == SelectPass.Sites.Bpqb)
+        {
+            _preciseStop = true;
+            _stopReach = 0.45f;
+            _bpqbStopByPose = true;   // 定点停车按位姿 z 收车（判定窗只有 30cm）
+        }
+        else if (seg == SelectPass.Sites.Zjzw)
+        {
+            _zjzwDynamic = true;
+            ConfigureZjzwRoute();
+        }
     }
 
     /// <summary>正常行驶：路径推进 + 纯跟踪转向（速度自适应前瞻）+ 分段限速/前方转角限速 + 卡死看门狗</summary>
     private void UpdateRun()
     {
         Vector3 pos = transform.position;
+        if (_sites == SelectPass.Sites.Default) SyncSegParams(_wpIndex);
 
-        // -1) 精准停点（仅 _preciseStop 路线）：向 hold 路点继续行驶，贴近 StopReach 才刹停。
+        // -1a) 侧方入库收车：按「行驶方向」判定，不看路点距离。
+        //   入位方向是 -x：车心 x 退到 _cftcStopX 即车尾已进库；z 只用来校验车身在库深范围内。
+        //   不能只看 z：纯跟踪实跑线比路点偏南约 0.5m，z 早在库口外 1.2m 就到位了（历史事故）。
+        //   不依赖 _stopAtIndex 是否已登记 —— 登记发生在离库 1.3m 处，那时再减速已经晚了。
+        if (_cftcStopByPose && _preciseStop && _gearReverse && _rev[_wpIndex])
+        {
+            float stopX = CftcStopX();                        // 路线自己的倒车终点
+            bool deepIn = pos.x <= stopX && pos.z <= _cftcStopZ;
+            bool overrun = pos.x <= stopX - 0.35f;            // 兜底：z 万一不达标也不许再往后怼
+            if (deepIn || overrun)
+            {
+                // 库内停稳 = 倒车段走完：进度直接落到「出库第一个前进路点」，
+                // 出库直接挂 D 走人（停在 lastRev 会因 _rev[17]=R 再刹一次、再挂 R 往后溜
+                // —— 就是「出库先回一下」）。
+                int lastRev = _wpIndex;
+                while (lastRev + 1 < _rev.Length && _rev[lastRev + 1]) lastRev++;
+                int nextWp = Mathf.Min(lastRev + 1, _wps.Length - 1);
+                _wpIndex = nextWp;
+                _stopAtIndex = -1;
+                Debug.Log(string.Format("[DEMO] 侧方入库到位 pos=({0:F2},{1:F2}) yaw={2:F0} Ab={3:F2} 车尾x={4:F2} lastRevWp={5}",
+                    pos.x, pos.z, NormYaw(transform.eulerAngles.y), pos.z + 32.806f, pos.x - 2.25f, lastRev));
+                bool nextRev = (lastRev + 1 < _rev.Length) ? _rev[lastRev + 1] : false;
+                BeginStop(nextRev != _gearReverse, _hold[Mathf.Clamp(lastRev, 0, _hold.Length - 1)], false);
+                return;
+            }
+        }
+
+        // -1b) 精准停点（仅 _preciseStop 路线）：向 hold 路点继续行驶，贴近 StopReach 才刹停。
         //     距离不减反增说明已被顶过停点 → 原地强制刹停兜底。
         if (_preciseStop && _stopAtIndex >= 0)
         {
             float dStop = FlatDist(pos, _wps[_stopAtIndex]);
-            if (dStop < _stopReach || dStop > _stopAtLastD + 0.1f)
+            // 半坡定点：按位姿 z 收车。Det_BPQB 的定点窗只认车心 z ∈ [40.88,41.18]（30cm），
+            // 靠「距路点 0.45m」触发再以 9km/h 硬刹，滑行量有 ±0.4m 抖动 —— 实测同一套代码
+            // 一轮落在 40.95（合格）、一轮落在 40.55（出窗判中途停车扣 100）。改成位姿触发。
+            bool bpqbPoseHit = _bpqbStopByPose && !_gearReverse && pos.z >= _bpqbStopZ;
+            // 位姿收车时禁用「距路点 StopReach」这条：路点 z=41.0，0.45m 兜底会在 z=40.55 就刹，
+            // 那时还没进判定窗 [40.88,41.18] → 判中途停车扣 100（v26 实测就是这个）。
+            bool reachHit = !_bpqbStopByPose && dStop < _stopReach;
+            if (bpqbPoseHit || reachHit || dStop > _stopAtLastD + 0.1f)
             {
                 int idx = _stopAtIndex;
                 _stopAtIndex = -1;
-                BeginStop(_rev[idx] != _gearReverse, _hold[idx], false);
+                if (bpqbPoseHit)
+                    Debug.Log(string.Format("[DEMO] 半坡定点到位 pos=({0:F2},{1:F2}) yaw={2:F0} distWp={3:F2}",
+                        pos.x, pos.z, NormYaw(transform.eulerAngles.y), dStop));
+                // 停稳后要不要换档，看「接下来要走的那一段」，不看当前段：
+                // 侧方库内停稳时当前段还是 R，但下一段（出库）是 D —— 就该在停稳这 3 秒里挂好 D，
+                // 出库直接走，不再多刹一次、也不会先往后溜。
+                bool nextRev = (idx + 1 < _rev.Length) ? _rev[idx + 1] : _gearReverse;
+                BeginStop(nextRev != _gearReverse, _hold[idx], false);
                 return;
             }
             _stopAtLastD = dStop;
@@ -515,7 +734,7 @@ public class DemoDriver : MonoBehaviour
         //    （倒车用镜像转向律：目标在车后方，取 atan2(lx, |lz|)）
         bool steerByLock = false;
         _routeSpeed = -1f;
-        if (_sites == SelectPass.Sites.Zjzw && _zjzwDynamic && !_gearReverse)
+        if (_activeSite == SelectPass.Sites.Zjzw && _zjzwDynamic && !_gearReverse)
         {
             // 几何闭环：每帧按当前位姿反解"落进出口道中心"所需半径 → 转向 + 车速
             float yawNow = transform.eulerAngles.y;
@@ -543,7 +762,7 @@ public class DemoDriver : MonoBehaviour
             _inLock = inTurn;
             steerByLock = true;
         }
-        else if (_sites == SelectPass.Sites.Zjzw && _zjzwLockArc && !_gearReverse)
+        else if (_activeSite == SelectPass.Sites.Zjzw && _zjzwLockArc && !_gearReverse)
         {
             float yaw = NormYaw(transform.eulerAngles.y); // 东=90，北=0，左转递减
             if (!_inLock)
@@ -568,15 +787,18 @@ public class DemoDriver : MonoBehaviour
                 }
             }
         }
-        // 侧方停车入库摆正：左打满保持到车身与库位划线平行（yaw≈90）。
-        // v15 实跑停稳 yaw≈82，车斜着停在库里不好看；纯跟踪在摆正段 steer 从
-        // -0.19 慢慢爬到 -1.00，回摆偏慢。显式保持满舵让 yaw 提前回到 88，
-        // 车身 Z 半跨同时从 1.2m 收到 0.9m，库底余量反而变大（更安全）。
-        else if (_sites == SelectPass.Sites.Cftc && _gearReverse &&
-                 _wpIndex >= 14 && _wpIndex <= 17 &&
-                 NormYaw(transform.eulerAngles.y) < 88f)
+        // 侧方停车入库摆正：把车身拉到与库边线平行（yaw=90）并锁住。
+        // 旧写法「满舵保持到 yaw≥88 再放手」会过冲：放手那一帧 yaw 已 88~90，
+        // 纯跟踪仍带着 -1.00 的舵，车继续往南摆到 95°，车尾怼库底墙（v21 实测扣 100）。
+        // 改成航向闭环：偏差大时自然饱和到满舵，接近 90 时自动回舵，过冲会自动反打。
+        else if (_activeSite == SelectPass.Sites.Cftc && _gearReverse &&
+                 RelWp >= 14 && RelWp <= 17)
         {
-            _steer = Mathf.MoveTowards(_steer, -1f, 4f * Time.deltaTime);
+            // Mathf.DeltaAngle(cur,target) = target-cur；而倒车时「舵越负 yaw 越大」，
+            // 故 cmd = -k·(90-yaw)：yaw 偏南→负舵摆正，过冲到 95°→正舵回摆。
+            float yawErr = Mathf.DeltaAngle(transform.eulerAngles.y, 90f); // = 90 - yaw
+            float cmd = Mathf.Clamp(-yawErr * 0.12f, -1f, 1f);
+            _steer = Mathf.MoveTowards(_steer, cmd, 4f * Time.deltaTime);
             _kernel.Hardware_SetSteering(_steer);
             steerByLock = true;
         }
@@ -585,10 +807,67 @@ public class DemoDriver : MonoBehaviour
         //（wpIndex 从 17 跳到 22/24、前瞻点方向突变），车头没来得及出缺口，
         // 在 x≈-9.83 蹭到库位东壁：contact=(-9.83,-31.09) carPos=(-12.19,-30.81)。
         // 按考试指南「出库左打满」，用位姿条件保持满舵，车头北抬后交回路线跟随。
-        else if (_sites == SelectPass.Sites.Cftc && !_gearReverse &&
-                 _wpIndex >= 18 && _wpIndex <= 26 && pos.z < -29.9f)
+        else if (_activeSite == SelectPass.Sites.Cftc && !_gearReverse &&
+                 RelWp >= 18 && RelWp <= 26 && pos.z < -29.9f)
         {
             _steer = Mathf.MoveTowards(_steer, -1f, 4f * Time.deltaTime);
+            _kernel.Hardware_SetSteering(_steer);
+            steerByLock = true;
+        }
+        // 倒车入库（v27）「挂 R 直接打满」：点位一到立刻满舵，车身摆正（yaw 到位）立刻回正。
+        // 为什么不继续用纯跟踪追弧点：实测打舵爬升有滞后，满舵吃满要 0.9m，
+        // 整条弧跟着后移，车尾西角扫到库口西翼（(-72.99,-37.93) vs 墙 x=-72.91）。
+        // 位姿条件是确定性的，与前瞻距离/路点疏密无关 —— 这才是「找准点位」该有的样子。
+        else if (_activeSite == SelectPass.Sites.Dcrk && _gearReverse &&
+                 RelWp >= 7 && RelWp <= 16 &&
+                 pos.x <= _dcrkLockX && NormYaw(transform.eulerAngles.y) > 2f)
+        {
+            // 第一次（右倒库）：车头朝东 90° → 目标朝北 0°，满舵正舵
+            _steer = Mathf.MoveTowards(_steer, 1f, 10f * Time.deltaTime);
+            _kernel.Hardware_SetSteering(_steer);
+            steerByLock = true;
+        }
+        else if (_activeSite == SelectPass.Sites.Dcrk && _gearReverse &&
+                 RelWp >= 26 && RelWp <= 35 &&
+                 pos.x >= _dcrkLockX2 && NormYaw(transform.eulerAngles.y) < -5f)
+        {
+            // 第二次（镜像倒库）：车头朝西 -90° → 目标朝北 0°，满舵反舵
+            _steer = Mathf.MoveTowards(_steer, -1f, 10f * Time.deltaTime);
+            _kernel.Hardware_SetSteering(_steer);
+            steerByLock = true;
+        }
+        // 倒库入位最后一段（车身已进库、离停点约 2m）：航向闭环把车摆正到 0°。
+        // 纯跟踪在库里这段 2m 直线纠不干净 —— 实测第一次停稳 yaw≈-1°（可接受），
+        // 第二次 yaw≈+3~4°，停车后肉眼就是「车有点歪」（2026-11-05）。
+        // 纠偏量限幅 ±0.4、增益 0.15：库里左右各只剩 0.65m，不能为大角度摆正把车尾蹭到库壁。
+        // 放在两条「挂 R 直接打满」分支之后，|yaw|>2 时仍由满舵接管。
+        else if (_activeSite == SelectPass.Sites.Dcrk && _gearReverse &&
+                 ((RelWp >= 13 && RelWp <= 16) || (RelWp >= 32 && RelWp <= 36)) &&
+                 pos.z < -39.0f && Mathf.Abs(NormYaw(transform.eulerAngles.y)) <= 10f)
+        {
+            float yawErr = Mathf.DeltaAngle(transform.eulerAngles.y, 0f); // = 0 - yaw
+            float cmd = Mathf.Clamp(-yawErr * 0.15f, -0.4f, 0.4f);
+            _steer = Mathf.MoveTowards(_steer, cmd, 4f * Time.deltaTime);
+            _kernel.Hardware_SetSteering(_steer);
+            steerByLock = true;
+        }
+        // 倒车入库（v27）出库「先正对库口直出」：库口缺口只有 2.65m（X[-72.91,-70.26]），
+        // 车身宽 1.664m，两侧合计余量不到 1m。第二次出库实测车在库口截面已斜 11°，
+        // 右后角蹭到东翼角点 (-70.26,-38.08) 扣 100 分。
+        // 车尾完全出库口需要车心 z > -35.83（库口线 -38.08 + 半车长 2.25）。
+        // v35：按驾考实操定点位——「驾驶座出库口再打方向」，即车心越过库口线 z=-38.08
+        // 才解除直出保护。v34 把阈值收到 -35.2（车开出库口 3m 才准转）导致车头冲过头，
+        // 满舵后弧顶怼上北墙 contact(-72.42,-31.06) 扣 100 分。
+        // 打舵有 ~0.1s 爬升（6.5km/h 下约 0.3m 行程），故阈值再提前 0.3m 取 -38.38，
+        // 使驾驶座压线瞬间方向盘正好开始转，与真车手感一致。
+        // v36：两段分开取点。第一次出库往西左转，车尾甩向西北；第二次往东右转，车尾甩向东南。
+        // 实测第二次车尾东角离库口东翼只剩 0.34m（第一次对西翼有 0.71m），故第二次再推后 0.5m，
+        // 让车尾多出库口一点再打舵。第一次保持「驾驶座压库口线」不变。
+        else if (_activeSite == SelectPass.Sites.Dcrk && !_gearReverse &&
+                 ((RelWp >= 16 && RelWp <= 22) || (RelWp >= 35 && RelWp <= 41)) &&
+                 pos.z < (RelWp >= 35 ? -37.00f : -38.38f))
+        {
+            _steer = Mathf.MoveTowards(_steer, 0f, 6f * Time.deltaTime);
             _kernel.Hardware_SetSteering(_steer);
             steerByLock = true;
         }
@@ -603,8 +882,11 @@ public class DemoDriver : MonoBehaviour
         Vector3 projPt; int projSeg;
         float crossErr = ProjectOnPath(pos, out projPt, out projSeg);
         float errFactor = Mathf.Clamp01(Mathf.Abs(crossErr) / 0.5f); // 偏 0.5m 时响应拉满
-        // 曲率前馈先算：既给转向用，也充当速度自适应前瞻的直/弯判据
-        float ff = (!_gearReverse && _wps != null && _wps.Length > 1) ? SteerFeedforward(projPt, projSeg) : 0f;
+        // 曲率前馈先算：既给转向用，也充当速度自适应前瞻的直/弯判据。
+        // v20：倒车也计算（原先 !_gearReverse 直接置 0）——倒车弧段恰恰最需要前馈。
+        float ff = (_wps != null && _wps.Length > 1)
+            ? SteerFeedforward(projPt, projSeg, _ffSpanFix, _ffSpanFix ? 1.5f : 0f)
+            : 0f;
         _lastFF = ff;
         // 速度自适应前瞻（Standard Assets 思路：跑得快看得远）——直道上前瞻随车速拉长压住画龙，
         // 弯道（前馈舵量超门槛）保持基础前瞻，防止前瞻一大提前切弯内侧
@@ -628,8 +910,45 @@ public class DemoDriver : MonoBehaviour
         if (_gearReverse) ang = Mathf.Atan2(local.x, Mathf.Max(-local.z, 0.15f));
         else ang = Mathf.Atan2(local.x, Mathf.Max(local.z, 0.15f));
         float steerTarget = Mathf.Clamp(ang * _steerGain, -1f, 1f);
+        // 倒车曲率前馈（v20，仅 Dcrk 启用 _ffSpanFix）：与前进同式直接叠加，符号取反
+        // （倒车跟踪同一弧线所需舵量与前进相反，v18/v19 实跑标定）。
+        // v19 教训：弯中「以前馈为主」的混合会互相压制——纯跟踪中段本给 0.9，
+        // 被 0.49 的前馈混到 0.55，弧更平、撞得更早。叠加后入口即满舵（纯跟踪欠的
+        // 正是入口那一脚），中段钳 1.0 ≈ 实测满舵半径 4.0m ≈ 计划弧 4.1m。
+        // 倒车航向误差（v26 先算，前馈阻尼和 Stanley 共用）：车尾指向 vs 路径行进切线。
+        Vector3 tanV = Vector3.zero;
+        float errRad = 0f;
+        if (_gearReverse && _ffSpanFix && projSeg >= 0 && projSeg < _wps.Length - 1)
+        {
+            tanV = _wps[projSeg + 1] - _wps[projSeg]; tanV.y = 0f;
+            if (tanV.sqrMagnitude > 1e-6f)
+                errRad = Vector3.SignedAngle(-transform.forward, tanV.normalized, Vector3.up) * Mathf.Deg2Rad;
+        }
+        if (_gearReverse && _ffSpanFix && !pendingStop)
+        {
+            float ffRev = -ff; // 倒车符号反转（v18/v19 实跑标定）
+            // 过旋转阻尼（v26）：车尾已转过计划切线时，弧还没走完的前馈会继续催转，
+            // 把 Stanley 的反向修正顶到钳制值——车尾甩过头扫库口翼墙（v22-v25 根源）。
+            // err 与 ffRev 同号 = 已转过 → 按角度线性掐前馈（11.5° 全掐）；滞后态不碰。
+            if (Mathf.Abs(errRad) > 1e-4f && Mathf.Sign(errRad) == Mathf.Sign(ffRev) && ffRev != 0f)
+            {
+                ffRev *= 1f - Mathf.Clamp01(Mathf.Abs(errRad) / 0.20f);
+            }
+            steerTarget = Mathf.Clamp(steerTarget + ffRev, -1f, 1f);
+        }
+        // 倒车航向修正（v25）：纯跟踪只纠位置不纠航向——车压在线上但朝向歪着时舵量归零，
+        // 残留偏航原样带进库内（v24 实测：出弧 -15° 一路倒进库，尾东角在库内刮东翼）。
+        // 符号（实测标定）：正舵=车尾向左；err>0(切线在尾右侧) 需要负舵向右回。
+        if (_gearReverse && _ffSpanFix && Mathf.Abs(errRad) > 1e-4f)
+        {
+            steerTarget = Mathf.Clamp(steerTarget - 2.5f * errRad, -1f, 1f);
+        }
         // 倒车舵量上限（仅精准停点路线）：限制"驶向新路点瞬间"的方向尖峰，
-        // 防止车头在倒车中持续偏转导致车尾下扫（2026-11-04 实测 10m 内 90°→45°）
+        // 防止车头在倒车中持续偏转导致车尾下扫（2026-11-04 实测 10m 内 90°→45°）。
+        // v23：钳制放在前馈叠加之后——前馈必须受钳制约束。Dcrk 用 0.88：
+        // 满舵 1.0 实际半径 ≈3.5m 比计划弧 4.1m 紧，90° 旋转提前 1.7m 完成、
+        // 前馈来不及收舵，车尾甩过头 -7° 扫到库口东翼（v22 实测 contact -70.26,-38.56）；
+        // 0.88 → 实际半径 ≈3.95m ≈ 计划 4.1m，旋转按计划完成、前馈按时归零。
         if (_gearReverse && _revSteerCap < 1f) steerTarget = Mathf.Clamp(steerTarget, -_revSteerCap, _revSteerCap);
         if (!_gearReverse && _wps.Length > 1 && !pendingStop)
         {
@@ -662,6 +981,32 @@ public class DemoDriver : MonoBehaviour
         if (_routeSpeed >= 0f) vTarget = _routeSpeed;
         vTarget = Mathf.Min(vTarget, CornerSpeedCap(pos)); // 前方转角限速：统一生效（几何闭环管转向，限速管车速，互不冲突）
         if (Mathf.Abs(_steer) > 0.5f) vTarget = Mathf.Min(vTarget, 7f); // 打舵限速兜底：须高于恒速 6.5，否则满舵段被钳回 6 → 低侧偏内切
+        // 临近精准停点：按剩余距离做减速规划（v = √(2·a·d)），到点自然停住。
+        // 旧做法是 6.5km/h 冲到跟前再一脚急刹，车会继续滑 0.4~0.5m —— 这就是
+        // 「入库没到位」「出库前先回一下」的根源（看着像倒车，其实是刹车距离）。
+        bool stopApproach = false;
+        if (_cftcStopByPose && _preciseStop && _gearReverse && _rev[_wpIndex])
+        {
+            // 侧方入库的停点是「车心 x 退到 _cftcStopX」，不是路点（路点还在 0.5m 外、
+            // 且实跑线偏南对不上）—— 减速规划必须按到这条线的距离算，
+            // 否则会以 5~6km/h 冲到线前再一脚刹，多滑 0.5m（= 出库前"先回一下"）。
+            float dAppr = Mathf.Max(pos.x - CftcStopX(), 0.02f);
+            // a=0.7m/s² 的平缓减速，末速不低于 2km/h 蠕行入位 —— 停下时几乎不滑。
+            float vAllow = Mathf.Sqrt(2f * 0.7f * Mathf.Max(dAppr - 0.05f, 0.01f)) * 3.6f;
+            vTarget = Mathf.Min(vTarget, Mathf.Max(vAllow, 2.0f));
+            stopApproach = true;
+        }
+        if (_bpqbStopByPose && _preciseStop && _stopAtIndex >= 0 && !_gearReverse)
+        {
+            // 半坡定点：按到「定点位姿线」的距离做减速规划，最后 2m 降到 3~4km/h 蠕行。
+            // 旧做法 9km/h 冲到 0.45m 再一脚刹，滑行 0.45~0.9m，停点抖出 30cm 判定窗。
+            float dAppr = Mathf.Max(_bpqbStopZ - pos.z, 0.02f);
+            // 末速下限 3.5km/h：坡上低于 3 油门顶不住（死区 0.2 会让轮速归零判中途停车），
+            // 3.5km/h 全刹滑行约 0.15m，正好补到位姿线之后。
+            float vAllow = Mathf.Sqrt(2f * 0.9f * Mathf.Max(dAppr - 0.05f, 0.01f)) * 3.6f;
+            vTarget = Mathf.Min(vTarget, Mathf.Max(vAllow, 3.5f));
+            stopApproach = true;
+        }
         float v = _kernel.speed;
         float throttle = 0f;
         float brake = 0f;
@@ -677,6 +1022,13 @@ public class DemoDriver : MonoBehaviour
         else if (v > vTarget + 2f)
         {
             brake = Mathf.Clamp((v - vTarget) * 0.3f, 0.15f, 0.7f);
+        }
+        // 接近停点：闸门不能用 +2km/h 死区（那样到跟前才刹，必然滑过 0.4m）。
+        // 只要超过规划速度就按比例上刹车，让车按 v=√(2ad) 的曲线平滑停住。
+        if (stopApproach && v > vTarget)
+        {
+            throttle = 0f;
+            brake = Mathf.Max(brake, Mathf.Clamp((v - vTarget) * 0.45f, 0.25f, 1f));
         }
         _kernel.Hardware_SetPedals(throttle, brake);
 
@@ -743,10 +1095,10 @@ public class DemoDriver : MonoBehaviour
             _pendingShift = false;
             if (_gears != null)
             {
-                if (_rev[_wpIndex]) _gears.R();
+                if (_shiftTargetRev) _gears.R();
                 else _gears.D();
             }
-            _gearReverse = _rev[_wpIndex];
+            _gearReverse = _shiftTargetRev;
             _shiftTimer = 0.8f; // 等档杆动画走完再起步
             _phase = DrivePhase.ShiftGear;
             return;
@@ -831,14 +1183,51 @@ public class DemoDriver : MonoBehaviour
     /// S 弯半径 ~7.5m 需要 δ≈19°（约半舵），纯跟踪反馈天生只给一半——弯中打不够、往外线漂就源于此。
     /// 前瞻 3m 采样 = 提前约 1.5 秒开始给舵，实现「根据弯曲度提前打方向」。
     /// </summary>
-    private float SteerFeedforward(Vector3 projPt, int projSeg)
+    private float SteerFeedforward(Vector3 projPt, int projSeg, bool spanFix, float backOffset = 0f)
     {
         int n = _wps.Length;
         if (n < 4) return 0f;
+        // backOffset（v21）：测量窗口起点沿路径后移。窗口 2m 前瞻会让前馈提前 2m 起坡，
+        // 倒库弧提前 ~1.3m 起弯、落线整体东移 0.9m（v20 实测压东翼 -70.26）。
+        // 后移 0.8m → 起弯推迟、弧中段量测不变、出口收舵稍晚。
+        if (backOffset > 0.001f)
+        {
+            float back = backOffset;
+            while (back > 0.0001f && projSeg >= 0)
+            {
+                Vector3 a = _wps[projSeg];
+                float d = FlatDist(projPt, a);
+                if (d >= back) { projPt += (a - projPt) * (back / Mathf.Max(d, 1e-5f)); back = 0f; }
+                else { back -= d; projPt = a; projSeg--; }
+            }
+            if (projSeg < 0) return 0f;
+        }
         // 航向角增量法：取投影点前方 ~2m 窗口，窗口两端方向向量的夹角 = 该段累计转角。
         // 弯道交接处（左弯→右弯）窗口内左右转角互相抵消，前馈平滑过零——
         // 旧版三点外接圆（1.8/3.0/4.2m）在交接处会横跨符号翻转，算出虚假大曲率，
         // 导致「上一个弯还没转完就猛打下一个弯的方向」。
+        if (spanFix)
+        {
+            // v22（仅 Dcrk）：窗口两端各取 0.6m 固定基线的弦方向 = 该 0.6m 子弧中点的切线。
+            // 原弦采样在窗口端点会取到不足整段的「部分弦」——弦越短，路点 0.01 取整噪声
+            // 把方向甩得越歪（v21 实测弧上 ff 虚高 1.09，真值 0.85，曲率虚高 38%）。
+            // 基线中点间距 = window - sample，圆弧上 kappa 严格 = 1/R；基线还能把噪声平均掉。
+            const float windowF = 2.0f, sample = 0.6f;
+            Vector3 pA = PathPointAlong(projPt, projSeg, sample, out int segA);
+            Vector3 pB = PathPointAlong(projPt, projSeg, windowF - sample, out int segB);
+            Vector3 pC = PathPointAlong(projPt, projSeg, windowF, out int segC);
+            if (segC < 0) return 0f; // 窗口越过路径末端，不做前馈
+            Vector3 d0v = pA - projPt; d0v.y = 0f;
+            Vector3 d1v = pC - pB; d1v.y = 0f;
+            if (d0v.magnitude < 1e-3f || d1v.magnitude < 1e-3f) return 0f;
+            d0v.Normalize(); d1v.Normalize();
+            float crossF = d0v.x * d1v.z - d0v.z * d1v.x;
+            float dHeadingF = Mathf.Asin(Mathf.Clamp(crossF, -1f, 1f));
+            float kappaF = Mathf.Abs(dHeadingF) / (windowF - sample);
+            if (kappaF < 0.005f) return 0f;
+            float degF = Mathf.Atan(_kernel.wheelBase * kappaF) * Mathf.Rad2Deg;
+            return -Mathf.Sign(dHeadingF) * degF / Mathf.Max(_kernel.steerAngle, 1f);
+        }
         const float window = 2.0f;
         Vector3 dir0 = Vector3.zero, dirEnd = Vector3.zero, prev = projPt;
         bool have0 = false;
@@ -876,6 +1265,24 @@ public class DemoDriver : MonoBehaviour
         return -Mathf.Sign(dHeading) * deg / Mathf.Max(_kernel.steerAngle, 1f);
     }
 
+    /// <summary>从 (p, seg) 沿路径前进 s 米的点；越过路径末端时 outSeg=-1 并钳到终点。</summary>
+    private Vector3 PathPointAlong(Vector3 p, int seg, float s, out int outSeg)
+    {
+        Vector3 cur = p;
+        float left = s;
+        int i = seg;
+        while (left > 0.0001f)
+        {
+            if (i < 0 || i >= _wps.Length - 1) { outSeg = -1; return _wps[_wps.Length - 1]; }
+            Vector3 nxt = _wps[i + 1];
+            float d = FlatDist(cur, nxt);
+            if (d >= left) { cur = cur + (nxt - cur) * (left / Mathf.Max(d, 1e-5f)); left = 0f; }
+            else { left -= d; cur = nxt; i++; }
+        }
+        outSeg = i;
+        return cur;
+    }
+
     /// <summary>把车投影到当前路径段附近，返回最近投影点和段索引（out），并返回带符号横向偏移（正 = 车在路径前进方向右侧）</summary>
     /// <summary>当前档位连续段的终点 wps 索引：前瞻/投影都不得越过它。
     /// 同一条线可能走两遍（Cftc 出库 = 入库倒车段逆序回放），路径自交叠；
@@ -887,15 +1294,35 @@ public class DemoDriver : MonoBehaviour
         if (_rev == null || _rev.Length != _wps.Length) return last;
         bool rev = _gearReverse;
         int end = Mathf.Clamp(_wpIndex, 0, last);
+        while (end < last && _rev[end] != rev) end++;   // 跳过还没推进到的换档点
         while (end < last && _rev[end + 1] == rev) end++;
         return end;
     }
 
     private float ProjectOnPath(Vector3 pos, out Vector3 bestPt, out int bestSeg)
     {
-        int firstSeg = Mathf.Max(0, _wpIndex - 1);
-        int lastSeg = Mathf.Min(_wps.Length - 2, _wpIndex + 2);
-        lastSeg = Mathf.Min(lastSeg, Mathf.Max(firstSeg, DriveSegEnd() - 1));
+        // 路线只作参考：在当前档位阶段的**整段**路径上找最近投影。
+        // 旧版把搜索窗锁在 _wpIndex±2（4 段折线），车一旦被顶偏/起步位姿有偏差，
+        // 投影点就钉死在那几段上，前瞻目标跟着跳到远处 —— 侧方出库起步"猛蹿"就是这么来的。
+        // 现在允许在全阶段范围内投影，车能自己顺着路线走回来，路点不再喧宾夺主。
+        int lastSegAll = _wps.Length - 2;
+        if (lastSegAll < 0) { bestPt = pos; bestSeg = 0; return 0f; }
+
+        int phaseEnd, phaseStart;
+        if (_rev != null && _rev.Length == _wps.Length)
+        {
+            bool rev = _gearReverse;
+            int p = Mathf.Clamp(_wpIndex, 0, _wps.Length - 1);
+            while (p < _wps.Length - 1 && _rev[p] != rev) p++;   // 跳过还没推进到的换档点
+            phaseEnd = p;
+            phaseStart = p;
+            while (phaseEnd < _wps.Length - 1 && _rev[phaseEnd + 1] == rev) phaseEnd++;
+            while (phaseStart > 0 && _rev[phaseStart - 1] == rev) phaseStart--;
+        }
+        else { phaseStart = 0; phaseEnd = _wps.Length - 1; }
+
+        int firstSeg = Mathf.Clamp(phaseStart, 0, lastSegAll);
+        int lastSeg = Mathf.Clamp(phaseEnd - 1, firstSeg, lastSegAll);
         float bestSqr = float.MaxValue;
         bestPt = _wps[firstSeg];
         bestSeg = firstSeg;
@@ -1011,9 +1438,159 @@ public class DemoDriver : MonoBehaviour
             case SelectPass.Sites.Dcrk: BuildDcrkPath(); return true;
             case SelectPass.Sites.Cftc: BuildCftcPath(); return true;
             case SelectPass.Sites.Bpqb: BuildBpqbPath(); return true;
+            case SelectPass.Sites.Default: BuildDefaultPath(); return true;
         }
         ShowCaption("该项目暂不支持演示", 5f);
         return false;
+    }
+
+    /// <summary>
+    /// 全科连续路线（Default）：把五个单科已验证路点按真实考试顺序首尾相接，
+    /// 科间用"连接段"路点把车从上一科终点实地开到下一科起点（不瞬移）。
+    /// 转向/精准停点等科目专属参数由 SyncSegParams 按当前路点所属科目动态切换。
+    /// ⚠ 连接段默认是两端点的直线桥接，可能穿过考场中的墙/库位——请在 Unity 编辑器中
+    ///   对照实际道路校准 _defaultConnectors（移动中间点绕开障碍）。
+    /// </summary>
+    private void BuildDefaultPath()
+    {
+        // 真实考试顺序（与场景地理一致：自西向东再一路向北的连续路线，
+        // 直角弯出口向北 16m 即半坡入口，坡顶向北直达曲线行驶）：
+        // 倒车入库 → 侧方停车 → 直角转弯 → 半坡起步 → 曲线行驶
+        var order = _defaultOrder;
+
+        // 1) 依次构建各科路径并快照（Build*Path 会改写 _wps/_speeds/... 等共享字段）
+        var snaps = new System.Collections.Generic.List<PathSnap>();
+        foreach (var s in order)
+        {
+            if (s == SelectPass.Sites.Dcrk)
+            {
+                // 全图考试不挪车：连续路线起点就是全图自己的入口 (-118.1,-33.5) 一带。
+                // 与单科共用同一份两次倒库几何，只换首点，避免两套几何漂移。
+                Vector3 here = transform.position;
+                BuildDcrkWps(new Vector3(here.x, 0f, here.z));
+            }
+            else if (s == SelectPass.Sites.Cftc) BuildCftcPath();
+            else if (s == SelectPass.Sites.Bpqb) BuildBpqbPath();
+            else if (s == SelectPass.Sites.Zjzw) BuildZjzwPath();
+            else if (s == SelectPass.Sites.Qxxs) BuildQxxsPath();
+            snaps.Add(new PathSnap
+            {
+                site = s, wps = _wps, speeds = _speeds, rev = _rev,
+                hold = _hold, hand = _handbrake, steps = _steps
+            });
+        }
+
+        var allWps = new System.Collections.Generic.List<Vector3>();
+        var allSpeeds = new System.Collections.Generic.List<float>();
+        var allRev = new System.Collections.Generic.List<bool>();
+        var allHold = new System.Collections.Generic.List<float>();
+        var allHand = new System.Collections.Generic.List<bool>();
+        var allSeg = new System.Collections.Generic.List<SelectPass.Sites>();
+        var allConn = new System.Collections.Generic.List<bool>();
+        var allSteps = new System.Collections.Generic.List<DemoStep>();
+        var allSegStart = new System.Collections.Generic.List<int>();
+
+        for (int k = 0; k < snaps.Count; k++)
+        {
+            var sn = snaps[k];
+            int baseWp = allWps.Count;
+            allSegStart.Add(baseWp);   // 本科段首点的全局索引（RelWp 换算用）
+            allWps.AddRange(sn.wps);
+            allSpeeds.AddRange(sn.speeds);
+            allRev.AddRange(sn.rev);
+            allHold.AddRange(sn.hold);
+            allHand.AddRange(sn.hand);
+            for (int i = 0; i < sn.wps.Length; i++) { allSeg.Add(sn.site); allConn.Add(false); }
+            foreach (var st in sn.steps)
+                allSteps.Add(new DemoStep { atWp = baseWp + st.atWp, text = st.text,
+                    turnSignalOn = st.turnSignalOn, turnSignalOff = st.turnSignalOff });
+
+            // 科间连接段：上一科终点 → 下一科起点，车实地开过去（非瞬移）
+            if (k < snaps.Count - 1)
+            {
+                Vector3 a = sn.wps[sn.wps.Length - 1];
+                Vector3 b = snaps[k + 1].wps[0];
+                Vector3[] mid = (_defaultConnectors != null && _defaultConnectors[k] != null)
+                    ? _defaultConnectors[k]
+                    : StraightBridge(a, b);
+                foreach (var p in mid)
+                {
+                    allWps.Add(p);
+                    allSpeeds.Add(6.5f);
+                    allRev.Add(false);
+                    allHold.Add(0f);
+                    allHand.Add(false);
+                    allSeg.Add(sn.site);   // 连接段归属上一科（仅用于日志），实际转向由 _segConn 强制为纯跟踪
+                    allConn.Add(true);
+                }
+            }
+        }
+
+        _wps = allWps.ToArray();
+        _speeds = allSpeeds.ToArray();
+        _rev = allRev.ToArray();
+        _hold = allHold.ToArray();
+        _handbrake = allHand.ToArray();
+        _segSite = allSeg.ToArray();
+        _segConn = allConn.ToArray();
+        _segStart = allSegStart.ToArray();
+        _steps = allSteps.ToArray();
+    }
+
+    private struct PathSnap
+    {
+        public SelectPass.Sites site;
+        public Vector3[] wps;
+        public float[] speeds;
+        public bool[] rev;
+        public float[] hold;
+        public bool[] hand;
+        public DemoStep[] steps;
+    }
+
+    /// <summary>两端点之间的直线桥接中间点（不含两端），每 ~15m 一个，便于在编辑器中逐个挪动绕障。</summary>
+    private static Vector3[] StraightBridge(Vector3 a, Vector3 b)
+    {
+        float d = Vector3.Distance(a, b);
+        int n = Mathf.Max(1, Mathf.RoundToInt(d / 15f));
+        var arr = new Vector3[n];
+        for (int i = 1; i <= n; i++)
+            arr[i - 1] = Vector3.Lerp(a, b, (float)i / (n + 1));
+        return arr;
+    }
+
+    /// <summary>配置直角转弯几何闭环路线参数（与 BuildZjzwPath 中一致；全科模式需在进入 Zjzw 段时按需重配）。</summary>
+    private void ConfigureZjzwRoute()
+    {
+        ZjzwTune t = appliedTune;
+        float entryZ = t != null ? t.entryZ : -33.5f;
+        float cornerX = t != null ? t.cornerX : 33.0f;
+        float radius = t != null ? t.radius : 3.33f;
+        float arcStep = t != null ? t.arcStep : 30f;
+        float exitEndZ = t != null ? t.exitEndZ : -19.2f;
+        float vApproach = t != null ? t.vApproach : 6.5f;
+        float vCorner = t != null ? t.vCorner : 6.5f;
+        float vExit = t != null ? t.vExit : 6.5f;
+        _routeCfg.entryZ = entryZ;
+        _routeCfg.exitX = 36.42f;
+        _routeCfg.exitEndZ = exitEndZ;
+        // 定版 401 的实测参数：入弯贴右 0.35m，给内侧直角 (34.41,-31.62) 留余量。
+        // 缺这一句时入口段走车道中线 z=-33.5，左后轮内切 0.35m 直接挂到内角上
+        // （2026-11-05 实测 contact(34.41,-31.62)，扣 100）。调参轮由 ApplyTune 注入，此处不覆盖。
+        if (t == null)
+        {
+            _routeCfg.entryLaneOffset = 0.35f;
+            _routeCfg.turnBias = 0f;
+            _routeCfg.radiusMax = 3.2f;
+        }
+        _routeCfg.vEntry = vApproach;
+        _routeCfg.vCorner = vCorner;
+        _routeCfg.vExit = vExit;
+        if (_kernel != null)
+        {
+            if (_kernel.wheelBase > 0.1f) _routeCfg.wheelBase = _kernel.wheelBase;
+            if (_kernel.steerAngle > 1f) _routeCfg.maxSteerDeg = _kernel.steerAngle;
+        }
     }
 
     /// <summary>
@@ -1023,39 +1600,175 @@ public class DemoDriver : MonoBehaviour
     /// 底部到 z=-43.1（Point_garage）。本路径按右库（车库中心 point_carbarn≈-72.9,-43.1）演示；
     /// 倒车段已按场景真值西移校准，使库内停稳点对齐车库中心（容差 difference_carbarn=3.2m）。
     /// </summary>
+    /// <summary>单科倒车入库：从标准起点 (-109.7,-25.8) 出发，按正常判定链完成两次倒库。</summary>
     private void BuildDcrkPath()
     {
+        BuildDcrkWps(new Vector3(-109.7f, 0f, -25.8f));
+    }
+
+    /// <summary>
+    /// 倒车入库路线（单科 / 全图共用，只有首点不同，避免两份几何漂移）。
+    /// A(D) 进场 → ST1 point_right 停稳 → B(R) 右倒库 → ST2 库内停稳
+    /// → C(D) 出库西行 → ST3 point_left 停稳 → D(R) 左倒库 → ST4 库内停稳
+    /// → E(D) 出库东行出倒库区。两次进库都是挂 R 的真实倒库动作。
+    /// Det_DCRK 判定链 Right→Carbarn→Left→Carbarn，ParkingCount==2 才 Destroy 出口空气墙
+    /// (x=-55.20, z[-38.42,-30.70])；全程不豁免、不传送。
+    /// 几何由 Tuning/plan_default_dcrk.py 生成，按玩家车真实碰撞体 1.664x4.496m 做连续扫掠校验。
+    /// 场景真值：库口缺口 X[-72.91,-70.26]、库口线 z=-38.08、库底 z=-43.38。
+    /// v18：按参考图两次都是「挂R直行一小段 → 打满舵 90° 圆弧 → 摆正直倒入位」；
+    /// 通道行驶线 z=-33.20（北移 1.22m，进出场口同线、不再斜切回原位），
+    /// 圆弧 R=4.10m ≈ 实跑标定的车辆满舵半径 4.00m，前瞻 3.5f 自然给满舵；
+    /// 北墙按内表面 z=-31.06 校验，库内中心 x=-71.60。
+    /// 车身包络用玩家车真实 BoxCollider 1.664x4.496m，连续扫掠最小余量 +0.064m。
+    /// </summary>
+    private void BuildDcrkWps(Vector3 start)
+    {
+        // v20：路点与 v18/v19 相同（两端对称 z=-33.20），修的是控制链——
+        //  1) SteerFeedforward 跨度修正（_ffSpanFix）：离散路点上 2m 窗只跨 1 个折点，
+        //     弧上曲率被低估一半（ff 恒 0.49，满舵需求 0.85）；
+        //  2) 倒车叠加前馈（符号取反）：v18/v19 实测弧段入口纯跟踪只给 0.59 舵，
+        //     车沿车道西溜 2m、整条弧变平，车尾扫到库口西翼 contact(-72.91,-38.08)；
+        //  3) 整条路线画到地面（黄=前进、红=倒车），A/C 停点对称可直接目视核对。
+        // 真实碰撞体 1.664x4.496m，连续扫掠最小余量 +0.064m；四个停点全部进判定窗。
         _wps = new Vector3[]
         {
-            new Vector3(-109.7f, 0f, -25.8f),  // 0 起点
-            new Vector3(-95.0f, 0f, -27.0f),   // 1
-            new Vector3(-84.0f, 0f, -28.5f),   // 2
-            new Vector3(-74.0f, 0f, -29.5f),   // 3
-            new Vector3(-66.5f, 0f, -30.0f),   // 4 停车点：车头驶过库口（挂R）
-            new Vector3(-65.5f, 0f, -32.0f),   // 5 倒车开始，右打死，车尾朝库口西南
-            new Vector3(-67.5f, 0f, -35.0f),   // 6 车尾进入库口（已西移对齐车库中心）
-            new Vector3(-70.0f, 0f, -38.0f),   // 7 车身转正（回正方向）
-            new Vector3(-72.0f, 0f, -40.5f),   // 8 继续直倒，逼近车库中心
-            new Vector3(-72.8f, 0f, -42.8f),   // 9 库内停稳（挂D，对齐 point_carbarn -72.86,-43.14）
-            new Vector3(-72.0f, 0f, -37.0f),   // 10 前进出库
-            new Vector3(-66.0f, 0f, -32.5f),   // 11 出库口（回到车道）
-            new Vector3(-62.0f, 0f, -31.0f),   // 12 向东拐
-            new Vector3(-57.0f, 0f, -33.0f),   // 13
-            new Vector3(-54.8f, 0f, -34.6f)    // 14 终点（End 前，不撞空气墙）
+            start,  // 0 A 起点（单科=标准起点；全图=车辆真实位置）
+            new Vector3(-105f, 0f, -33.2f),  // 1 A
+            new Vector3(-95f, 0f, -33.2f),  // 2 A
+            new Vector3(-85f, 0f, -33.2f),  // 3 A
+            new Vector3(-79.5f, 0f, -33.2f),  // 4 A
+            new Vector3(-72f, 0f, -33.2f),  // 5 A
+            new Vector3(-62.98f, 0f, -33.2f),  // 6 A ST point_right 停稳→挂R
+            new Vector3(-65.5f, 0f, -33.2f),  // 7 B 挂R先直行一小段（参考图 A→B 虚线直线段）
+            new Vector3(-67.5f, 0f, -33.2f),  // 8 B 车头过起始线→右打满
+            new Vector3(-68.56f, 0f, -33.34f),  // 9 B
+            new Vector3(-69.55f, 0f, -33.75f),  // 10 B
+            new Vector3(-70.4f, 0f, -34.4f),  // 11 B
+            new Vector3(-71.05f, 0f, -35.25f),  // 12 B
+            new Vector3(-71.46f, 0f, -36.24f),  // 13 B
+            new Vector3(-71.6f, 0f, -37.3f),  // 14 B
+            new Vector3(-71.6f, 0f, -39.6f),  // 15 B
+            new Vector3(-71.6f, 0f, -41f),  // 16 B ST 库内停稳→挂D
+            new Vector3(-71.6f, 0f, -39.6f),  // 17 C
+            new Vector3(-71.6f, 0f, -37.3f),  // 18 C
+            new Vector3(-71.74f, 0f, -36.24f),  // 19 C
+            new Vector3(-72.15f, 0f, -35.25f),  // 20 C
+            new Vector3(-72.8f, 0f, -34.4f),  // 21 C
+            new Vector3(-73.65f, 0f, -33.75f),  // 22 C
+            new Vector3(-74.64f, 0f, -33.19f),  // 23 C
+            new Vector3(-75.7f, 0f, -33.05f),  // 24 C
+            new Vector3(-80.25f, 0f, -33.2f),  // 25 C ST point_left 回车区停稳→挂R
+            new Vector3(-78f, 0f, -33.2f),  // 26 D 挂R先直行一小段（参考图 C→B 虚线直线段）
+            new Vector3(-75.7f, 0f, -33.2f),  // 27 D
+            new Vector3(-74.64f, 0f, -33.34f),  // 28 D
+            new Vector3(-73.65f, 0f, -33.75f),  // 29 D
+            new Vector3(-72.8f, 0f, -34.4f),  // 30 D
+            new Vector3(-72.15f, 0f, -35.25f),  // 31 D
+            new Vector3(-71.74f, 0f, -36.24f),  // 32 D
+            new Vector3(-71.6f, 0f, -37.3f),  // 33 D
+            new Vector3(-71.6f, 0f, -39.6f),  // 34 D
+            new Vector3(-71.6f, 0f, -41f),  // 35 D ST 库内停稳 ParkingCount==2→空气墙销毁
+            new Vector3(-71.6f, 0f, -39.6f),  // 36 E
+            new Vector3(-71.6f, 0f, -37.3f),  // 37 E
+            new Vector3(-71.46f, 0f, -36.24f),  // 38 E
+            new Vector3(-71.05f, 0f, -35.25f),  // 39 E
+            new Vector3(-70.4f, 0f, -34.4f),  // 40 E
+            new Vector3(-69.55f, 0f, -33.75f),  // 41 E
+            new Vector3(-68.56f, 0f, -33.19f),  // 42 E
+            new Vector3(-67.5f, 0f, -33.2f),  // 43 E
+            new Vector3(-52f, 0f, -34.6f),  // 44 E 出口对正 End(-54.8,-34.6)：到这点前 2.2m 收车，车正好压在 End 上
+            new Vector3(-44f, 0f, -34.6f)  // 45 E 越过 End 后再收车（否则停车被 Det_DCRK 判中途停车扣 5）
         };
-        _speeds = new float[] { 8, 8, 8, 7, 4, 4, 4, 4, 4, 4, 8, 8, 8, 8, 8 };
-        _rev = new bool[] { false, false, false, false, true, true, true, true, true, false, false, false, false, false, false };
-        _hold = new float[] { 0, 0, 0, 0, 1.5f, 0, 0, 0, 0, 2f, 0, 0, 0, 0, 0 };
+        // v33：整条倒库行驶线北移 0.35m（z=-33.20 → -32.85），让车身左侧贴近左边线。
+        // 这是驾考的习惯做法：车身离左边线近，倒库起点到库口的横向距离更大，
+        // 打满后的弧有更多容错，左右两边都不容易压线。
+        // 只平移 0..43（出口段 44/45 要对正 End 的 z=-34.6，不参与）。
+        for (int i = 0; i < 44 && i < _wps.Length; i++)
+            _wps[i] = new Vector3(_wps[i].x, _wps[i].y, _wps[i].z - 0.35f);
+
+        // v27：全程恒速 6.5（与直角弯/侧方/曲线统一）。倒库段原先降到 4，实测车速掉到 3
+        // 且 throttle=0（贴在油门死区边界滑行）——低速下打舵响应滞后，满舵爬升吃掉 0.9m
+        // 点位余量，整条弧后移，车尾西角扫到库口西翼（(-72.99,-37.93) vs 墙 x=-72.91）。
+        _speeds = new float[]
+        {
+            6.5f, 6.5f, 6.5f, 6.5f, 6.5f, 6.5f, 6.5f,
+            6.5f, 6.5f, 6.5f, 6.5f, 6.5f, 6.5f, 6.5f, 6.5f, 6.5f, 6.5f,
+            6.5f, 6.5f, 6.5f, 6.5f, 6.5f, 6.5f, 6.5f, 6.5f, 6.5f,
+            6.5f, 6.5f, 6.5f, 6.5f, 6.5f, 6.5f, 6.5f, 6.5f, 6.5f, 6.5f,
+            6.5f, 6.5f, 6.5f, 6.5f, 6.5f, 6.5f, 6.5f, 6.5f, 6.5f, 6.5f
+        };
+        _rev = new bool[]
+        {
+            false, false, false, false, false, false, true,
+            true, true, true, true, true, true, true, true, true, false,
+            false, false, false, false, false, false, false, false, true,
+            true, true, true, true, true, true, true, true, true, false,
+            false, false, false, false, false, false, false, false, false, false
+        };
+        _hold = new float[]
+        {
+            0f, 0f, 0f, 0f, 0f, 0f, 2f,
+            0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 2f,
+            0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 2f,
+            0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 2f,
+            0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f
+        };
         _handbrake = new bool[_wps.Length];
         _steps = new DemoStep[]
         {
-            new DemoStep { atWp = 0, text = "① 起步：挂 D 档沿通道行驶，保持车身与库位边线约 1.5 米距离" },
-            new DemoStep { atWp = 2, text = "② 观察右后视镜确认库口位置，控制车速缓慢行驶" },
-            new DemoStep { atWp = 4, text = "③ 车头驶过库口后停车，挂 R 档，向右打死方向开始倒车" },
-            new DemoStep { atWp = 6, text = "④ 从右后视镜看到车身与库位平行时，迅速回正方向" },
-            new DemoStep { atWp = 8, text = "⑤ 观察左后视镜下沿接近库底线时停车——入库完成" },
-            new DemoStep { atWp = 10, text = "⑥ 挂 D 档前进出库，驶向出口完成项目" }
+            new DemoStep { atWp = 0,  text = "① 沿考试车道驶入倒车入库区域" },
+            new DemoStep { atWp = 6,  text = "② 右库口停稳，挂 R 档开始第一次倒库" },
+            new DemoStep { atWp = 16, text = "③ 库内停稳，挂 D 档出库" },
+            new DemoStep { atWp = 25, text = "④ 左库口停稳，挂 R 档开始第二次倒库" },
+            new DemoStep { atWp = 35, text = "⑤ 库内停稳，两次倒库完成，出口空气墙解除" },
+            new DemoStep { atWp = 36, text = "⑥ 出库东行，驶向出口" }
         };
+        // 四个判定停点必须落进 point_right/left 的 2m 窗与库内 Ab<=3.2 窗；
+        // 普通到达距离 2.2m 会停在窗外。倒车前瞻收短，避免纯跟踪切内弯导致车不南下、车尾扫库口横墙。
+        _preciseStop = true;
+        _stopReach = 0.7f;
+        _lookReverseOverride = 3.5f;
+        // v27「直接打满」：倒库不再靠纯跟踪慢慢磨弧，改由位姿条件满舵（见 UpdateRun），
+        // 因此关掉曲率前馈跨度修正与倒车航向修正（那套是给纯跟踪补欠舵的，位姿满舵下用不上）。
+        _ffSpanFix = false;
+        _revSteerCap = 1f;     // 打满：不再钳 0.88
+        // v19：整条行驶路线画到地面上（黄=前进段，红=倒车段），对应参考图的虚线轨迹；
+        // A/C 两个停点同在 z=-33.20 这一条行驶线上，画出来可直接目视核对两边对称。
+        // 【按要求去掉前进段黄色辅助线】地面的黄色线横跨整条考试车道，视觉干扰大，
+        // 只保留红色倒车段轨迹。DrawRouteLine 保留（revSeg=true 仍在用）。
+        // DrawRouteLine("DcrkRouteFwd", false, new Color(1f, 0.9f, 0.15f, 0.95f));
+        DrawRouteLine("DcrkRouteRev", true, new Color(1f, 0.2f, 0.1f, 0.95f));
+    }
+
+    /// <summary>把当前 _wps 路线画成地面标线（LineRenderer，y=0.06）。
+    /// revSeg=true 只画倒车段。长段按 0.4m 细分让圆弧平滑；换档分界处断线，
+    /// 停点位置一目了然。运行时重建，退出 Play 自动随场景销毁。</summary>
+    private void DrawRouteLine(string lineName, bool revSeg, Color col)
+    {
+        if (_wps == null || _rev == null || _wps.Length != _rev.Length) return;
+        var old = GameObject.Find(lineName);
+        if (old != null) Destroy(old);
+        var go = new GameObject(lineName);
+        var lr = go.AddComponent<LineRenderer>();
+        lr.material = new Material(Shader.Find("Sprites/Default"));
+        lr.startColor = col;
+        lr.endColor = col;
+        lr.startWidth = 0.07f;
+        lr.endWidth = 0.07f;
+        lr.numCornerVertices = 4;
+        lr.useWorldSpace = true;
+        var pts = new System.Collections.Generic.List<Vector3>();
+        for (int i = 0; i < _wps.Length - 1; i++)
+        {
+            if (_rev[i] != revSeg) { pts.Clear(); continue; } // 换档分界断线
+            Vector3 a = _wps[i], b = _wps[i + 1];
+            a.y = 0.06f; b.y = 0.06f;
+            int n = Mathf.Max(1, Mathf.CeilToInt(Vector3.Distance(a, b) / 0.4f));
+            for (int k = 0; k < n; k++) pts.Add(Vector3.Lerp(a, b, (float)k / n));
+        }
+        if (pts.Count < 2) { Destroy(go); return; }
+        lr.positionCount = pts.Count;
+        lr.SetPositions(pts.ToArray());
     }
 
     /// <summary>
@@ -1086,11 +1799,18 @@ public class DemoDriver : MonoBehaviour
         //   Ab=-31.4+32.806=1.406≤1.65、车尾 z≈-32.53 离库底 -32.87 余 0.34m；
         // 下一帧再到 (-15.0,-31.7) 就会压库底（contact -13.09,-32.85）。
         // 故触发距离取 1.05m，正好在这帧刹停。point_left 判定窗 2m，1.05m 提前量同样在窗内。
-        _stopReach = 1.05f;
-        // 前瞻 3.5 是唯一能让摆正段完整回摆（yaw 90°→54°→92°）的值。
-        // v11 试 2.2 → 摆正段舵量反转、yaw 63°→50°，勿再改；v10 拉平 wp12/wp13 同样毁掉回摆。
-        _lookReverseOverride = 3.5f;
+        // 【v30】改成 0.45：现在入库停点由位姿 z 阈值 + 临近减速规划负责，
+        // 距离触发退回纯兜底；再留 1.05m 会在车还没到位时抢先刹停。
+        _stopReach = 0.45f;
+        // 【v28 更正】这里原来写 3.5，但 5025eb2（实测 100 分那一版）StartDemo 尾部有一行
+        // `_lookReverseOverride = -1f` 在 BuildPath() 之后执行，把这行覆盖掉了——
+        // 也就是说「100 分」那次实际跑的是默认 2.6m 前瞻，3.5 从未真正生效。
+        // v27 为修倒库把重置移到 BuildPath() 之前后，3.5 突然生效：倒车弧整体提前起弯，
+        // 实跑停车点从 (-14.3,-31.4) 漂到 (-13.9,-30.9)，Ab=1.90 > 1.65 判不成入库到位。
+        // 故侧方显式锁回 -1（= 用 _lookReverse 2.6m），与实测 100 分的状态一致。
+        _lookReverseOverride = -1f;
         _revSteerCap = 1.0f;
+        _cftcStopByPose = true;   // 库内收车：停点取倒车段终点（CftcStopX），z 只做深度校验
         // 场地数据（Tuning/field_data.py ← Unity 权威 dump）：
         //   车道 Z[-30.25,-26.62]；库位 X[-17.75,-9.74] Z[-32.87,-30.25]（深仅 2.62m）
         //   判定 Ab = cz+32.806 ≤ 1.65 → 停稳点 cz ≤ -31.156
@@ -1183,15 +1903,19 @@ public class DemoDriver : MonoBehaviour
     {
         _preciseStop = true; // 定点必须停进 Det_BPQB 的 1.2m 判定窗
         _stopReach = 0.45f;  // 半坡定点用默认触发距离（Cftc 改小了 _stopReach，此处复位）
+        _bpqbStopByPose = true;   // 真正收车按位姿 z（见 _bpqbStopZ）；_stopReach 只作兜底
         _wps = new Vector3[]
         {
             new Vector3(33.68f, 0f, -2.81f),  // 0 出生点，先向东北并入坡道
             new Vector3(34.8f, 0f, 4.0f),     // 1
-            new Vector3(35.15f, 0f, 12.0f),   // 2 对正右边线（东墙 x=36.37 以西约 1.25m）
+            // 2~7 必须贴着右线走：Det_BPQB 用的是 Bc=cos·距离（左右分量），窗口 [2.4,2.7]
+            // 相对停车点 x=32.692 → 车心 x 只能落在 35.09~35.39。半坡定点的考试要求就是
+            // 「右侧车身距边缘线 30cm 以内」，往左挪会直接判不合格（2026-11-05 实测 34.7 → Bc=2.0 扣 100）。
+            new Vector3(35.15f, 0f, 12.0f),   // 2 对正右边线（东墙 x=36.37 以西约 1.25m，车身右缘距墙约 0.34m）
             new Vector3(35.15f, 0f, 22.0f),   // 3 进入坡段
             new Vector3(35.15f, 0f, 32.0f),   // 4 爬坡
             new Vector3(35.15f, 0f, 38.5f),   // 5 接近定点，收油
-            new Vector3(35.15f, 0f, 41.0f),   // 6 定点停车（精准停点停稳，z=41.0 落在合法带 [40.68,41.88] 居中）
+            new Vector3(35.15f, 0f, 41.0f),   // 6 定点停车（位姿收车 z≥40.95，Ab=43.58-z 落 2.4~2.9 窗内）
             new Vector3(35.15f, 0f, 44.8f),   // 7 松手刹起步过坡顶
             new Vector3(34.6f, 0f, 47.8f),    // 8 下坡稍回正
             new Vector3(33.85f, 0f, 49.6f)    // 9 终点刹停（End 50.47 前，车头距端墙 z=52.2 约 0.3m）
@@ -1242,6 +1966,15 @@ public class DemoDriver : MonoBehaviour
         _routeCfg.entryZ = entryZ;
         _routeCfg.exitX = 36.42f;
         _routeCfg.exitEndZ = exitEndZ;
+        // 定版 401 的实测参数：入弯贴右 0.35m（ZjzwRouteCfg 注释：正=向南侧/外线偏移）。
+        // 缺这一句时入口段跟车道中线 z=-33.5，满舵内切 0.35m 会挂上内侧直角
+        // (34.41,-31.62)——2026-11-05 单科实测正是挂在这里扣 100。调参轮由 ApplyTune 注入。
+        if (t == null)
+        {
+            _routeCfg.entryLaneOffset = 0.35f;
+            _routeCfg.turnBias = 0f;
+            _routeCfg.radiusMax = 3.2f;
+        }
         _routeCfg.vEntry = vApproach;
         _routeCfg.vCorner = vCorner;
         _routeCfg.vExit = vExit;
