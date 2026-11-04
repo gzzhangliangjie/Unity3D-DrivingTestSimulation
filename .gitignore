@@ -34,10 +34,20 @@ desktop.ini
 # WorkBuddy 工程数据（记忆/会话数据，不入库）
 .workbuddy/
 
-# 直角转弯调参工具：只入库跑批脚本与定版配置，其余运行产物（结果/标记/场景dump）不入库
+# 调参/场地数据工具链：只入库脚本与定版数据，运行产物（日志/撞墙记录/flag/结果集）不入库
 /Tuning/*
 !/Tuning/tune_zjzw.py
 !/Tuning/zjzw_tuning.json
+# 路线驱动 / 场地数据获取流程（2026-11-04）
+!/Tuning/field_data.py
+!/Tuning/field_data.json
+!/Tuning/rebuild_and_run.py
+!/Tuning/run_examsim.py
+!/Tuning/stamp.py
+!/Tuning/check_compile.py
+!/Tuning/focus_unity.py
+!/Tuning/probe_walls_static.py
+!/Tuning/zjzw_scene_dump.txt
 
 # 构建产物
 *.apk

@@ -33,12 +33,13 @@ public class DemoDriver : MonoBehaviour
 
     // ---- 路径跟踪参数（原为 const；调参模式下可被 ZjzwTuner 从外部 JSON 热注入）----
     private float _arriveDist = 2.2f;    // 到达路径点的判定距离（米）
+    private float _arriveDistRev = 1.0f;  // 倒车段专用到达距离（缓慢倒车时 2.2m 会让 wp 虚推进、车进不了库）
     private float _lookForward = 3.0f;   // 前进纯跟踪前瞻距离（米）；太大会提前切弯内侧
     private float _lookReverse = 2.6f;   // 倒车纯跟踪前瞻距离（倒车精度要求高）
     private float _steerGain = 2.4f;     // 纯跟踪转向增益（角度误差 → 归一化转向）
     private float _steerSpeedFwd = 2.4f; // 前进时方向盘转动速率（归一化/秒）
     [System.NonSerialized] public float _crossGain = 1.1f; // Stanley 横向误差增益（偏移米数 → 额外打角），调参器可覆盖
-    private float _throttleMax = 0.8f;   // 油门上限（半坡爬坡无力时调大）
+    private float _throttleMax = 1.0f;   // 油门上限（半坡爬坡无力时调大；2026-11-04 提到 1.0 才能冲上坡顶）
 
     // ---- 路径跟踪增强（参考 Unity Standard Assets CarAIControl / WaypointProgressTracker）----
     private float _lookSpeedGain = 0.5f;  // 速度自适应前瞻增益（米前瞻 / (米/秒)）：直道随车速拉长前瞻压画龙
@@ -115,6 +116,23 @@ public class DemoDriver : MonoBehaviour
     private float _shiftTimer;      // 换档等待计时
     private float _stuckTimer;      // 防卡死计时
     private bool _demoUsed;         // 用过演示后 R 键才生效
+
+    // ---- 精准停点（2026-11-04 新增，仅侧方/半坡启用）----
+    // 原逻辑：推进进 hold 路点的瞬间就 BeginStop，而推进发生在距"上一个"路点
+    // _arriveDist(2.2m) 处 → 实际停点比 hold 路点提前 2~7m。侧方停车因此停不进
+    // point_left 2m 窗（倒车目标落在车后方→纯跟踪全反→满舵甩头压线），
+    // 半坡定点停不进 Det_BPQB 的 1.2m 判定窗。启用后：行驶到贴近 hold 点
+    // StopReach 内才刹停，停点误差 <0.5m。Dcrk 的既有停点已按旧提前量标定，
+    // 保持旧行为不动（_preciseStop 只在 Cftc/Bpqb 构建路线时置 true）。
+    private bool _preciseStop;      // 是否启用精准停点
+    private int _stopAtIndex = -1;  // 精准停点目标路点（-1=无）
+    private float _stopAtLastD = 999f; // 上一帧距停点距离（不减反增=已越过→强制刹停兜底）
+    private float _stopReach = 0.45f;  // 贴近停点的判定距离（米）；Cftc 入库段收窄到 0.25 防倒过头撞后墙
+    // 倒车专项（仅 _preciseStop 路线生效）：侧方停车倒车段纯跟踪会持续偏转，
+    // 10m 内车头从 90° 掉到 45°（车尾下扫 1.5m 撞后墙）。拉长前瞻稳住直线跟踪 +
+    // 限制倒车舵量上限防"驶向新路点瞬间"的方向尖峰饱和。
+    private float _lookReverseOverride = -1f; // >0 时覆盖 _lookReverse
+    private float _revSteerCap = 1f;          // 倒车舵量上限（1=不限制）
 
     // ============================================================
     //  调参模式（ZjzwTuner 驱动；参数从项目根 Tuning/zjzw_tuning.json 热注入，
@@ -353,6 +371,10 @@ public class DemoDriver : MonoBehaviour
         _pendingFinish = false;
         _holdRemaining = 0f;
         _shiftTimer = 0f;
+        _stopAtIndex = -1;
+        _stopAtLastD = 999f;
+        _lookReverseOverride = -1f;
+        _revSteerCap = 1f;
         _phase = DrivePhase.Run;
         _state = DemoState.Driving;
         _demoUsed = true;
@@ -419,8 +441,23 @@ public class DemoDriver : MonoBehaviour
     {
         Vector3 pos = transform.position;
 
+        // -1) 精准停点（仅 _preciseStop 路线）：向 hold 路点继续行驶，贴近 StopReach 才刹停。
+        //     距离不减反增说明已被顶过停点 → 原地强制刹停兜底。
+        if (_preciseStop && _stopAtIndex >= 0)
+        {
+            float dStop = FlatDist(pos, _wps[_stopAtIndex]);
+            if (dStop < _stopReach || dStop > _stopAtLastD + 0.1f)
+            {
+                int idx = _stopAtIndex;
+                _stopAtIndex = -1;
+                BeginStop(_rev[idx] != _gearReverse, _hold[idx], false);
+                return;
+            }
+            _stopAtLastD = dStop;
+        }
+
         // 0) 段方向检查：下一段需要 R/D 而当前档位不符 → 刹停换档
-        if (_wpIndex < _wps.Length - 1 && _rev[_wpIndex] != _gearReverse)
+        if (_stopAtIndex < 0 && _wpIndex < _wps.Length - 1 && _rev[_wpIndex] != _gearReverse)
         {
             BeginStop(true, 0f, false);
             return;
@@ -438,12 +475,13 @@ public class DemoDriver : MonoBehaviour
         //    a) 正常到达：距目标点 < 到达距离；
         //    b) 兜底越过：距下一点比距当前目标更近（车已越过目标点，如被
         //       别的物体顶偏）。含停车保持/换档的点不允许 b)，必须真实到达。
-        if (_wpIndex < _wps.Length - 1 && (_wpIndex > 0 || _leftStart))
+        if (_stopAtIndex < 0 && _wpIndex < _wps.Length - 1 && (_wpIndex > 0 || _leftStart))
         {
             float dCur = FlatDist(pos, _wps[_wpIndex]);
             float dNext = FlatDist(pos, _wps[_wpIndex + 1]);
             bool mustStopHere = _hold[_wpIndex] > 0f || _rev[_wpIndex] != _gearReverse;
-            if (dCur < _arriveDist || (!mustStopHere && dNext < dCur))
+            float arrive = _rev[_wpIndex] ? _arriveDistRev : _arriveDist;
+            if (dCur < arrive || (!mustStopHere && dNext < dCur))
             {
                 _wpIndex++;
                 FireStepsAt(_wpIndex);
@@ -456,8 +494,17 @@ public class DemoDriver : MonoBehaviour
                 }
 
                 bool needShift = _rev[_wpIndex] != _gearReverse;
+                if (_preciseStop && _hold[_wpIndex] > 0f)
+                {
+                    // 精准停点（仅 _preciseStop 路线）：不立即刹停，登记停点，
+                    // 行驶到贴近该路点（StopReach）再刹停（见 UpdateRun 开头）
+                    _stopAtIndex = _wpIndex;
+                    _stopAtLastD = 999f;
+                    return;
+                }
                 if (needShift || _hold[_wpIndex] > 0f)
                 {
+                    // 旧行为：纯换档点 / 未启用精准停点的路线，在推进位置直接刹停
                     BeginStop(needShift, _hold[_wpIndex], false);
                     return;
                 }
@@ -521,9 +568,35 @@ public class DemoDriver : MonoBehaviour
                 }
             }
         }
+        // 侧方停车入库摆正：左打满保持到车身与库位划线平行（yaw≈90）。
+        // v15 实跑停稳 yaw≈82，车斜着停在库里不好看；纯跟踪在摆正段 steer 从
+        // -0.19 慢慢爬到 -1.00，回摆偏慢。显式保持满舵让 yaw 提前回到 88，
+        // 车身 Z 半跨同时从 1.2m 收到 0.9m，库底余量反而变大（更安全）。
+        else if (_sites == SelectPass.Sites.Cftc && _gearReverse &&
+                 _wpIndex >= 14 && _wpIndex <= 17 &&
+                 NormYaw(transform.eulerAngles.y) < 88f)
+        {
+            _steer = Mathf.MoveTowards(_steer, -1f, 4f * Time.deltaTime);
+            _kernel.Hardware_SetSteering(_steer);
+            steerByLock = true;
+        }
+        // 侧方停车出库：方向盘左打满并保持，直到车中心北抬出库口。
+        // v14 实跑：出库第一帧 steer=-1.00 但只持续一帧就回正到 +0.08
+        //（wpIndex 从 17 跳到 22/24、前瞻点方向突变），车头没来得及出缺口，
+        // 在 x≈-9.83 蹭到库位东壁：contact=(-9.83,-31.09) carPos=(-12.19,-30.81)。
+        // 按考试指南「出库左打满」，用位姿条件保持满舵，车头北抬后交回路线跟随。
+        else if (_sites == SelectPass.Sites.Cftc && !_gearReverse &&
+                 _wpIndex >= 18 && _wpIndex <= 26 && pos.z < -29.9f)
+        {
+            _steer = Mathf.MoveTowards(_steer, -1f, 4f * Time.deltaTime);
+            _kernel.Hardware_SetSteering(_steer);
+            steerByLock = true;
+        }
         if (!steerByLock)
         {
         _driveTime += Time.deltaTime;
+        // 精准停点待停标志：停点附近前进/倒车段常共线重叠，前瞻/投影全部不可信
+        bool pendingStop = _preciseStop && _stopAtIndex >= 0;
         // 横向误差（Stanley 项）：车偏出路径时按偏移量直接反打方向。
         // 0.15m 内线性淡入——贴线时完全交给纯跟踪，避免两套修正互搏形成振荡回路（方向盘大幅甩动）；
         // 偏出 0.15m 后纠偏全权介入，偏差一出现（不用等碰到边线）就开始快速回正
@@ -542,13 +615,23 @@ public class DemoDriver : MonoBehaviour
             float curveAuth = Mathf.Clamp01((_lookCurveGate - ffAbs) / _lookCurveGate); // 1=直道 → 0=接近门槛
             lookFwd += _lookSpeedGain * Mathf.Max(_kernel.speed / 3.6f, 0f) * curveAuth;
         }
-        Vector3 target = LookaheadPoint(pos, _gearReverse ? _lookReverse : lookFwd);
+        // 精准停点待停期间：直接瞄准停点本身，不走全路径前瞻——
+        // 2026-11-04 实测：前进段与倒车段在停点共线重叠，前瞻点落到倒车段上，
+        // 车沿倒车路径"前进"拐进东翼横墙（contact -5.94,-30.21）
+        Vector3 target = pendingStop
+            ? _wps[_stopAtIndex]
+            : LookaheadPoint(pos, _gearReverse
+                ? (_lookReverseOverride > 0f ? _lookReverseOverride : _lookReverse)
+                : lookFwd);
         Vector3 local = transform.InverseTransformPoint(target);
         float ang;
         if (_gearReverse) ang = Mathf.Atan2(local.x, Mathf.Max(-local.z, 0.15f));
         else ang = Mathf.Atan2(local.x, Mathf.Max(local.z, 0.15f));
         float steerTarget = Mathf.Clamp(ang * _steerGain, -1f, 1f);
-        if (!_gearReverse && _wps.Length > 1)
+        // 倒车舵量上限（仅精准停点路线）：限制"驶向新路点瞬间"的方向尖峰，
+        // 防止车头在倒车中持续偏转导致车尾下扫（2026-11-04 实测 10m 内 90°→45°）
+        if (_gearReverse && _revSteerCap < 1f) steerTarget = Mathf.Clamp(steerTarget, -_revSteerCap, _revSteerCap);
+        if (!_gearReverse && _wps.Length > 1 && !pendingStop)
         {
             float vMps = Mathf.Max(_kernel.speed / 3.6f, 1.2f); // m/s
             float auth = Mathf.Clamp01(Mathf.Abs(crossErr) / 0.15f);
@@ -794,10 +877,25 @@ public class DemoDriver : MonoBehaviour
     }
 
     /// <summary>把车投影到当前路径段附近，返回最近投影点和段索引（out），并返回带符号横向偏移（正 = 车在路径前进方向右侧）</summary>
+    /// <summary>当前档位连续段的终点 wps 索引：前瞻/投影都不得越过它。
+    /// 同一条线可能走两遍（Cftc 出库 = 入库倒车段逆序回放），路径自交叠；
+    /// 若不按档位阶段截断，倒车入库时前瞻会越过停点看到折返回东的出库段，
+    /// 目标点跳到车后方 → 舵量反转、车身不再摆正（v12 实测）。</summary>
+    private int DriveSegEnd()
+    {
+        int last = _wps.Length - 1;
+        if (_rev == null || _rev.Length != _wps.Length) return last;
+        bool rev = _gearReverse;
+        int end = Mathf.Clamp(_wpIndex, 0, last);
+        while (end < last && _rev[end + 1] == rev) end++;
+        return end;
+    }
+
     private float ProjectOnPath(Vector3 pos, out Vector3 bestPt, out int bestSeg)
     {
         int firstSeg = Mathf.Max(0, _wpIndex - 1);
         int lastSeg = Mathf.Min(_wps.Length - 2, _wpIndex + 2);
+        lastSeg = Mathf.Min(lastSeg, Mathf.Max(firstSeg, DriveSegEnd() - 1));
         float bestSqr = float.MaxValue;
         bestPt = _wps[firstSeg];
         bestSeg = firstSeg;
@@ -840,10 +938,12 @@ public class DemoDriver : MonoBehaviour
         Vector3 bestPt; int bestSeg;
         ProjectOnPath(pos, out bestPt, out bestSeg);
 
-        // 2) 从投影点沿路径（弧长）向前找 look 米处的目标点
+        // 2) 从投影点沿路径（弧长）向前找 look 米处的目标点；
+        //    搜索截断在当前档位阶段终点，防止跨到折返的出库段（见 DriveSegEnd）
+        int endWp = DriveSegEnd();
         float remain = look;
         Vector3 from = bestPt;
-        for (int i = bestSeg; i < _wps.Length - 1; i++)
+        for (int i = bestSeg; i < endWp; i++)
         {
             Vector3 b = _wps[i + 1];
             float d = FlatDist(from, b);
@@ -857,7 +957,7 @@ public class DemoDriver : MonoBehaviour
             remain -= d;
             from = b;
         }
-        return new Vector3(_wps[_wps.Length - 1].x, pos.y, _wps[_wps.Length - 1].z);
+        return new Vector3(_wps[endWp].x, pos.y, _wps[endWp].z);
     }
 
     /// <summary>
@@ -920,7 +1020,8 @@ public class DemoDriver : MonoBehaviour
     /// 倒车入库（右库）：起点(-109.7,-25.8)朝东 → 沿通道前进驶过库口 → 停车挂R
     /// → 右打倒车入库 → 库内停稳挂D → 前进出库驶向 End(-54.6,-34.8)。
     /// 库口在 z=-34.4 一线（Point_left/-79.5 与 Point_right/-63.7 为左右库口中心），
-    /// 底部到 z=-43.1（Point_garage）。本路径按右库（x≈-63.7）演示，坐标为估算值。
+    /// 底部到 z=-43.1（Point_garage）。本路径按右库（车库中心 point_carbarn≈-72.9,-43.1）演示；
+    /// 倒车段已按场景真值西移校准，使库内停稳点对齐车库中心（容差 difference_carbarn=3.2m）。
     /// </summary>
     private void BuildDcrkPath()
     {
@@ -931,14 +1032,14 @@ public class DemoDriver : MonoBehaviour
             new Vector3(-84.0f, 0f, -28.5f),   // 2
             new Vector3(-74.0f, 0f, -29.5f),   // 3
             new Vector3(-66.5f, 0f, -30.0f),   // 4 停车点：车头驶过库口（挂R）
-            new Vector3(-65.5f, 0f, -32.5f),   // 5 倒车开始，右打死
-            new Vector3(-64.5f, 0f, -35.5f),   // 6 车尾进入库口
-            new Vector3(-64.3f, 0f, -38.5f),   // 7 车身转正（回正方向）
-            new Vector3(-64.4f, 0f, -41.0f),   // 8 继续直倒
-            new Vector3(-64.5f, 0f, -42.8f),   // 9 库内停稳（挂D）
-            new Vector3(-64.5f, 0f, -37.0f),   // 10 前进出库
-            new Vector3(-64.3f, 0f, -32.5f),   // 11 出库口
-            new Vector3(-61.0f, 0f, -31.0f),   // 12 向东拐
+            new Vector3(-65.5f, 0f, -32.0f),   // 5 倒车开始，右打死，车尾朝库口西南
+            new Vector3(-67.5f, 0f, -35.0f),   // 6 车尾进入库口（已西移对齐车库中心）
+            new Vector3(-70.0f, 0f, -38.0f),   // 7 车身转正（回正方向）
+            new Vector3(-72.0f, 0f, -40.5f),   // 8 继续直倒，逼近车库中心
+            new Vector3(-72.8f, 0f, -42.8f),   // 9 库内停稳（挂D，对齐 point_carbarn -72.86,-43.14）
+            new Vector3(-72.0f, 0f, -37.0f),   // 10 前进出库
+            new Vector3(-66.0f, 0f, -32.5f),   // 11 出库口（回到车道）
+            new Vector3(-62.0f, 0f, -31.0f),   // 12 向东拐
             new Vector3(-57.0f, 0f, -33.0f),   // 13
             new Vector3(-54.8f, 0f, -34.6f)    // 14 终点（End 前，不撞空气墙）
         };
@@ -958,78 +1059,162 @@ public class DemoDriver : MonoBehaviour
     }
 
     /// <summary>
-    /// 侧方停车：起点(-39.9,-28.5)朝东 → 沿车道行驶（库位在右侧，Point_garage -17.6,-32.8）
-    /// → 车头驶过库位停车挂R → 右打倒入 → 车身平行停稳挂D → 打左灯左打死出库 → 驶向 End(4.0,-28.4)。
-    /// 坐标为估算值。
+    /// 侧方停车：起点(-39.9,-28.5)朝东 → 先沿车道北侧（Z≈-25，清空库墙西立面北沿-26.59）
+    /// 东行进入库区 X 范围 → 向南切入 point_left(-4.15,-28.37) 触发倒车 →
+    /// 挂R向右后倒入库（车尾向西南，对齐 Point_garage -17.64,-32.81）→ 停稳挂D →
+    /// 打左灯出库（北返车道再东出）→ 驶向 End(4.56,-28.44)。
+    /// 关键：前进段必须自"墙北侧面"入位（仿 Dcrk），严禁在 Z≈-29 处正撞库墙西立面(X=-24.22)。
+    /// 库内停稳点按 point_carbarn(-17.64,-32.81) 校准（容差 difference_carbarn=1.65m）。
+    /// </summary>
+    /// <summary>
+    /// 侧方停车（v4，按 Z 镜像标定后的真实几何）：车道位于北边线(z=-26.6)与两翼横墙(z=-30.25)
+    /// 之间的走廊（z≈-28.5，出生点即在其上）。沿车道东行 → 停在 point_left(-4.15,-28.37) 处
+    /// （<2m 触发倒车阶段）→ 挂 R 向右后倒（车头朝东→倒车向西），车尾甩入库位口袋
+    /// x(-17.7,-9.8)（开口朝北，后墙 z=-32.9）→ 库内停稳 (-17.2,-31.0)：x 与 carbarn(-17.64,-32.81) 纵向对齐，
+    /// Ab=cos·dist≈0.4≤1.65 判停车到位（Det_CFTC 仅校验纵向投影，故停点取 x≈-17.2）→ 挂 D 前进出库回车道 → 东行出 End(4.56,-28.44)。
+    /// 全程恒速 6.5 km/h（与直角弯/曲线行驶统一，见 Tuning/驾驶参数规范.md）。
+    /// 关键标定（Tuning/analyze_bay.py 修正 Z 镜像后）：北边线 z=-26.6 全宽 x[-24.2,-2.8]；
+    /// 西翼横墙 z=-30.25 x[-24.2,-17.7]；东翼横墙 z=-30.25 x[-9.8,-2.8]；
+    /// wall_hit 三处接触点均只与镜像布局吻合——旧 v2 走北车道(z=-25.3)必然压北边线。
     /// </summary>
     private void BuildCftcPath()
     {
+        _preciseStop = true; // 停点必须精准：point_left 2m 窗 + 库内 Ab 1.65 窗
+        // 【v14】0.25→1.05，按 v13 实跑逐帧标定：纯跟踪让实跑比路点偏南 0.5~0.8m，
+        // 精准停点若按「距路点 0.25/0.60m」触发永远够不着，车会一路倒到库底。
+        // v13 帧 (-14.3,-31.4) yaw=82 distWp=1.0 是安全停稳点：
+        //   Ab=-31.4+32.806=1.406≤1.65、车尾 z≈-32.53 离库底 -32.87 余 0.34m；
+        // 下一帧再到 (-15.0,-31.7) 就会压库底（contact -13.09,-32.85）。
+        // 故触发距离取 1.05m，正好在这帧刹停。point_left 判定窗 2m，1.05m 提前量同样在窗内。
+        _stopReach = 1.05f;
+        // 前瞻 3.5 是唯一能让摆正段完整回摆（yaw 90°→54°→92°）的值。
+        // v11 试 2.2 → 摆正段舵量反转、yaw 63°→50°，勿再改；v10 拉平 wp12/wp13 同样毁掉回摆。
+        _lookReverseOverride = 3.5f;
+        _revSteerCap = 1.0f;
+        // 场地数据（Tuning/field_data.py ← Unity 权威 dump）：
+        //   车道 Z[-30.25,-26.62]；库位 X[-17.75,-9.74] Z[-32.87,-30.25]（深仅 2.62m）
+        //   判定 Ab = cz+32.806 ≤ 1.65 → 停稳点 cz ≤ -31.156
+        //   车身斜 θ 时 Z 半跨 = 2.25·sinθ + 0.9·cosθ；θ=43° 时 2.23m，
+        //   故斜置峰值车中心要在 [-30.64, -28.87] 之间才同时不碰北墙与库底。
+        // 考试指南示意图：①车道停稳 → ②直线后倒 → ③右打满约 45° → ④回正直退
+        //                → ⑤左打满摆正、车身平行库边停稳。
+        // 历史教训：v8 整段北移 0.45 → 右打满时车头甩上北边线 -26.64（进库段必须靠南）；
+        //   v6 刚挂 R 就南下 → 车尾在缺口外怼东翼横墙（wp6~8 直线后倒不能省）。
+        // 用户定版原则：「出库本质就是反向的入库，走的是同一条线，操作也是类似的」——
+        //   故出库不另编路点，直接把入库倒车段逆序回放；入库 右打满→回正→左打满，
+        //   沿同一条线反向走，曲率符号自动取反 → 出库 左打满→回正→右打满。
+        //   方向盘由路线几何决定，不靠纯跟踪反馈去猜。
         _wps = new Vector3[]
         {
-            new Vector3(-39.9f, 0f, -28.5f),  // 0 起点
-            new Vector3(-33.0f, 0f, -28.8f),  // 1
-            new Vector3(-26.0f, 0f, -29.2f),  // 2
-            new Vector3(-19.5f, 0f, -29.5f),  // 3
-            new Vector3(-14.5f, 0f, -29.8f),  // 4 停车点：车头已驶过库位（挂R）
-            new Vector3(-15.5f, 0f, -31.2f),  // 5 倒车右打死
-            new Vector3(-16.5f, 0f, -32.5f),  // 6 车尾进库
-            new Vector3(-18.0f, 0f, -33.2f),  // 7 回正（左镜见库右前角）
-            new Vector3(-19.5f, 0f, -33.4f),  // 8 左打死调整
-            new Vector3(-21.0f, 0f, -33.3f),  // 9 库内停稳（挂D）
-            new Vector3(-20.0f, 0f, -32.0f),  // 10 左打驶出
-            new Vector3(-18.0f, 0f, -30.2f),  // 11
-            new Vector3(-14.5f, 0f, -29.2f),  // 12 回正
-            new Vector3(-8.0f, 0f, -28.6f),   // 13
-            new Vector3(-2.0f, 0f, -28.4f),   // 14
-            new Vector3(3.5f, 0f, -28.4f)     // 15 终点（End 前）
+            new Vector3(-39.9f, 0f, -28.5f),  // 0 出生点，沿车道东行
+            new Vector3(-30.0f, 0f, -28.5f),  // 1 车道走廊
+            new Vector3(-20.0f, 0f, -28.5f),  // 2
+            new Vector3(-12.0f, 0f, -28.5f),  // 3
+            new Vector3(-7.0f, 0f, -28.6f),   // 4 接近停车观察点，渐向库口一侧靠
+            new Vector3(-4.15f, 0f, -28.70f), // 5 ① 前进停稳：距 point_left(-4.15,-28.37) 0.33m
+            new Vector3(-6.0f, 0f, -28.70f),  // 6 ② 挂 R 直线后倒，方向盘正（θ=0）
+            new Vector3(-7.8f, 0f, -28.70f),  // 7 ② 继续直退
+            new Vector3(-9.2f, 0f, -28.75f),  // 8 ② 直退末端：车尾 x≈-11.45 已进库口缺口
+            new Vector3(-10.0f, 0f, -28.95f), // 9 ③ 右打满 θ≈14°（v7 南位，车头不扫北墙）
+            new Vector3(-10.8f, 0f, -29.45f), // 10 ③ θ≈32°，车尾甩入库口
+            new Vector3(-11.6f, 0f, -30.20f), // 11 ③ θ≈43° 斜置峰值；半跨2.23m→北端-27.97/南端-32.43，双向有余
+            new Vector3(-12.0f, 0f, -30.58f), // 12 ④ 回正方向，保持约 43° 直退（v9 原值，南下斜率是摆正指令）
+            new Vector3(-12.8f, 0f, -30.70f), // 13 ⑤ 左打满摆正 θ≈22°
+            new Vector3(-13.5f, 0f, -30.80f), // 14 ⑤ θ≈16°
+            new Vector3(-14.2f, 0f, -30.87f), // 15 ⑤ θ≈12°
+            new Vector3(-14.8f, 0f, -30.90f), // 16 ⑤ θ≈9°，车身接近平行库边
+            new Vector3(-15.1f, 0f, -30.90f)  // 17 ⑤ 水平段 θ=0 停稳
         };
-        _speeds = new float[] { 8, 8, 8, 7, 4, 4, 4, 4, 4, 4, 6, 7, 8, 8, 8, 8 };
-        _rev = new bool[] { false, false, false, false, true, true, true, true, true, false, false, false, false, false, false, false };
-        _hold = new float[] { 0, 0, 0, 0, 1.5f, 0, 0, 0, 0, 2f, 0, 0, 0, 0, 0, 0 };
-        _handbrake = new bool[_wps.Length];
+
+        // 上面这 18 点即「入库主线」，也是 Tuning/field_data.py 静态解析的路线来源。
+        // 出库 = 同一条倒车轨迹逆序回放（前进档）：enter[16] → enter[6]，
+        // 再接回车道东行收尾。这样整条演示只有一条 S 线，方向盘序列由它的曲率给出。
+        Vector3[] enter = _wps;
+        var path = new System.Collections.Generic.List<Vector3>(enter);
+        for (int i = enter.Length - 2; i >= 6; i--) path.Add(enter[i]); // 16,15,...,6
+        path.Add(new Vector3(-4.15f, 0f, -28.70f));  // 回到 point_left 一带
+        // 终点要真的开到 End(4.56,-28.44) / WinWall 触发考试结算。
+        // 推进逻辑在「距倒数第二点 2.2m」就推进到末点并 FinishDemo，
+        // 故倒数第二点须放在 6.7 左右，车中心才会落在 x≈4.5 的 End 触发区。
+        // 旧值 0/2.5 让车停在 x≈-2.2，演示自行结束后 Det_CFTC 把静止 1s
+        // 判成「中途停车」扣 5 分（v15 实测 95 分）。
+        path.Add(new Vector3(6.7f, 0f, -28.44f));
+        path.Add(new Vector3(8.5f, 0f, -28.44f));
+        _wps = path.ToArray();
+
+        int n = _wps.Length;
+        _speeds = new float[n];
+        _rev = new bool[n];
+        _hold = new float[n];
+        _handbrake = new bool[n];
+        for (int i = 0; i < n; i++)
+        {
+            _speeds[i] = 6.5f;              // 全程恒速 6.5 km/h
+            _rev[i] = (i >= 6 && i <= 17);  // 6..17 为 R 档入库；推进到 18 时自动换 D 出库
+        }
+        _hold[5] = 2.5f;  // ① point_left 停稳看点
+        _hold[17] = 3f;   // ⑤ 库内停稳，Det_CFTC 判停车到位
         _steps = new DemoStep[]
         {
-            new DemoStep { atWp = 0, text = "① 起步：挂 D 档沿车道行驶，车身距库位边线约 30 公分" },
-            new DemoStep { atWp = 2, text = "② 观察右侧后视镜确认库位，控制车速缓慢行驶" },
-            new DemoStep { atWp = 4, text = "③ 车头驶过库位后停车，挂 R 档，向右打死方向倒入" },
-            new DemoStep { atWp = 6, text = "④ 左后视镜出现库右前角时，回正方向继续倒" },
-            new DemoStep { atWp = 8, text = "⑤ 左后轮即将压库左边线时向左打死，车身平行后停稳" },
-            new DemoStep { atWp = 9, text = "⑥ 挂 D 档，打开左转向灯，向左打死方向驶出库位", turnSignalOn = true },
-            new DemoStep { atWp = 12, text = "⑦ 车身出库后回正方向，关闭转向灯，驶出项目", turnSignalOff = true }
+            new DemoStep { atWp = 0, text = "① 起步：沿车道走廊东行，车身靠右" },
+            new DemoStep { atWp = 5, text = "② 行至停车观察点停稳（右后视镜对齐库位前线）" },
+            new DemoStep { atWp = 6, text = "③ 挂倒挡直线后倒，车身保持平行" },
+            new DemoStep { atWp = 9, text = "④ 车尾到库口后向右打满，车身斜向库位" },
+            new DemoStep { atWp = 12, text = "⑤ 车身约 45° 时回正方向，继续直退" },
+            new DemoStep { atWp = 13, text = "⑥ 向左打满摆正车头，车身与库位边线平行" },
+            new DemoStep { atWp = 17, text = "⑦ 库内停稳：车身与库位边线平行，距线约 30 公分" },
+            new DemoStep { atWp = 18, text = "⑧ 挂前进挡，左打满沿原线反向出库" },
+            new DemoStep { atWp = 22, text = "⑨ 车身斜出后回正直行，车头驶出库口" },
+            new DemoStep { atWp = 25, text = "⑩ 右打满摆正，车身与车道平行" },
+            new DemoStep { atWp = 29, text = "⑪ 回到车道东行，完成侧方停车项目" }
         };
     }
 
     /// <summary>
-    /// 半坡起步：起点(33.7,-2.8)朝北 → 上坡对正右边线30公分 → 定点停车（Point_garage 33.0,43.6）
-    /// → 拉手刹 → 松手刹半联动起步 → 下坡 → 驶向 End(33.8,50.5)。坐标为估算值。
+    /// 半坡起步：起点(33.68,-2.81)朝北 → 上坡贴右边线（x=35.15，距东墙 x=36.37 约 30 公分）
+    /// → 精准定点停车 (35.15,41.0)（Det_BPQB 窗口：Bc=|x-32.69|∈[2.4,2.7] ✓2.46，
+    ///   Ab=|z-43.58|∈[1.7,2.9] → 合法停车带 z∈[40.68,41.88]，wp6=41.0 居中留足余量）→ 拉手刹
+    ///   → 松手刹起步过坡顶 → 下坡 → End(33.78,50.47)。
+    /// 旧路线 x≈33 停在 (32.9,43.6)：Bc=0.21 远小于 2.4 → 停车瞬间被判"中途停车"扣 100（3 次全败）。
+    /// 注意：爬坡段（驶向 wp5/wp6）目标速度必须保持 10，中途掉到 5 会触发"v>目标+2→刹车"，
+    /// 坡上刹车丢速即 stall（2026-11-04 第七轮回归的根因）。
     /// </summary>
     private void BuildBpqbPath()
     {
+        _preciseStop = true; // 定点必须停进 Det_BPQB 的 1.2m 判定窗
+        _stopReach = 0.45f;  // 半坡定点用默认触发距离（Cftc 改小了 _stopReach，此处复位）
         _wps = new Vector3[]
         {
-            new Vector3(33.7f, 0f, -2.8f),   // 0 起点
-            new Vector3(33.6f, 0f, 5.0f),    // 1
-            new Vector3(33.5f, 0f, 15.0f),   // 2
-            new Vector3(33.4f, 0f, 25.0f),   // 3
-            new Vector3(33.2f, 0f, 35.0f),   // 4 开始减速爬坡
-            new Vector3(33.0f, 0f, 41.5f),   // 5 缓行接近定点
-            new Vector3(32.9f, 0f, 43.6f),   // 6 定点停车（拉手刹）
-            new Vector3(32.9f, 0f, 45.5f),   // 7 半联动起步过坡顶
-            new Vector3(33.0f, 0f, 47.5f),   // 8
-            new Vector3(33.4f, 0f, 49.5f),   // 9
-            new Vector3(33.8f, 0f, 50.5f)    // 10 终点（End 前）
+            new Vector3(33.68f, 0f, -2.81f),  // 0 出生点，先向东北并入坡道
+            new Vector3(34.8f, 0f, 4.0f),     // 1
+            new Vector3(35.15f, 0f, 12.0f),   // 2 对正右边线（东墙 x=36.37 以西约 1.25m）
+            new Vector3(35.15f, 0f, 22.0f),   // 3 进入坡段
+            new Vector3(35.15f, 0f, 32.0f),   // 4 爬坡
+            new Vector3(35.15f, 0f, 38.5f),   // 5 接近定点，收油
+            new Vector3(35.15f, 0f, 41.0f),   // 6 定点停车（精准停点停稳，z=41.0 落在合法带 [40.68,41.88] 居中）
+            new Vector3(35.15f, 0f, 44.8f),   // 7 松手刹起步过坡顶
+            new Vector3(34.6f, 0f, 47.8f),    // 8 下坡稍回正
+            new Vector3(33.85f, 0f, 49.6f)    // 9 终点刹停（End 50.47 前，车头距端墙 z=52.2 约 0.3m）
         };
-        _speeds = new float[] { 9, 9, 8, 7, 5, 4, 4, 5, 7, 8, 8 };
-        _rev = new bool[] { false, false, false, false, false, false, false, false, false, false, false };
-        _hold = new float[] { 0, 0, 0, 0, 0, 0, 2.5f, 0, 0, 0, 0 };
-        _handbrake = new bool[] { false, false, false, false, false, false, true, false, false, false, false };
+        // 速度数组语义：_speeds[i] = 正在驶向 wps[i] 时的目标车速（wpIndex 到达上一
+        // 点前 2.2m 就提前推进）。死亡区 z 29.8→38.5 属于"正在驶向 wp5"段 → 必须改
+        // _speeds[5]（2026-11-04 第二轮就是改错了索引，改成了 [3][4]）。
+        // Det_BPQB 只要一帧 Speed==0（轮速取整，<0.5km/h 即 0）且未经窗口就扣 100；
+        // 非路线模式油门死区 1.0km/h：旧目标 7 时 v=6 油门切 0，坡上滑行掉速，实测
+        // 在 z≈35.5 轮速归零判中途停车。爬坡各段目标 10，油门持续 ≥0.35 顶着坡。
+        // 关键：wp6（定点段）目标也保持 10——中途掉到 5 会触发"v>目标+2→刹车"，坡上
+        // 刹车丢速即 stall（第七轮回归根因）；定点靠精准停点在 StopReach 内硬刹停，不受影响。
+        _speeds = new float[] { 9, 9, 10, 10, 10, 10, 10, 9, 9, 8 };
+        _rev = new bool[] { false, false, false, false, false, false, false, false, false, false };
+        _hold = new float[] { 0, 0, 0, 0, 0, 0, 3f, 0, 0, 0 };
+        _handbrake = new bool[] { false, false, false, false, false, false, true, false, false, false };
         _steps = new DemoStep[]
         {
             new DemoStep { atWp = 0, text = "① 起步：对正坡道，挂 D 档上坡，车身距右边线约 30 公分" },
             new DemoStep { atWp = 3, text = "② 接近定点时松油门，轻带刹车控制车速缓行上坡" },
             new DemoStep { atWp = 6, text = "③ 前保险杠对准定点标线——踩死刹车停稳，拉起手刹（定点完成）" },
             new DemoStep { atWp = 7, text = "④ 松手刹，轻踩油门半联动起步，防止车辆后溜" },
-            new DemoStep { atWp = 9, text = "⑤ 越过坡顶后控制车速下坡，驶向出口完成项目" }
+            new DemoStep { atWp = 8, text = "⑤ 越过坡顶后控制车速下坡，驶向出口完成项目" }
         };
     }
 
